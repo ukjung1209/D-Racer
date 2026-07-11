@@ -37,7 +37,8 @@ class LaneNode(Node):
         # --- 토픽/발행 관련 (기동 시 고정) ---
         self.declare_parameter('image_topic', 'camera/image/compressed')
         self.declare_parameter('lane_topic', 'lane/state')
-        self.declare_parameter('debug_topic', 'lane/debug/compressed')
+        self.declare_parameter('debug_raw_topic', 'lane/debug/raw')   # 원본+사다리꼴
+        self.declare_parameter('debug_bev_topic', 'lane/debug/bev')   # 펼친 BEV+검출점
         self.declare_parameter('publish_debug', True)
         self.declare_parameter('jpeg_quality', 90)
         self.declare_parameter('vehicle_config_file', get_default_vehicle_config_path())
@@ -54,12 +55,13 @@ class LaneNode(Node):
         self.declare_parameter('lane_half_width_px', 90)        # 한쪽만 보일 때 반대편 추정
 
         # --- 버드아이뷰(BEV) 원근변환: ROI 폭/높이 비율(0~1)로 사다리꼴 4점 지정 ---
+        # 사다리꼴 양 옆변이 두 오렌지 선을 그대로 덮도록 맞춰야 BEV가 편다.
         self.declare_parameter('bev_enable', True)
-        self.declare_parameter('bev_top_left', 0.40)      # 윗변 좌측 x (좁게)
-        self.declare_parameter('bev_top_right', 0.60)     # 윗변 우측 x
-        self.declare_parameter('bev_top_y', 0.30)         # 윗변 y (ROI 높이 비율) — 지평선 아래로 내려 배경 제외
-        self.declare_parameter('bev_bottom_left', 0.0)    # 아랫변 좌측 x (넓게)
-        self.declare_parameter('bev_bottom_right', 1.0)   # 아랫변 우측 x
+        self.declare_parameter('bev_top_left', 0.28)      # 윗변 좌 = 위쪽 오렌지 선 위치
+        self.declare_parameter('bev_top_right', 0.72)     # 윗변 우 = 위쪽 오렌지 선 위치
+        self.declare_parameter('bev_top_y', 0.32)         # 윗변 y (ROI 높이 비율) — 배경 제외
+        self.declare_parameter('bev_bottom_left', 0.0)    # 아랫변 좌 = 아래쪽 오렌지 선 위치
+        self.declare_parameter('bev_bottom_right', 1.0)   # 아랫변 우 = 아래쪽 오렌지 선 위치
 
         # --- 테스트 조향(PD) 파라미터 ---
         self.declare_parameter('publish_control', False)
@@ -72,7 +74,8 @@ class LaneNode(Node):
 
         image_topic = str(self.get_parameter('image_topic').value)
         lane_topic = str(self.get_parameter('lane_topic').value)
-        debug_topic = str(self.get_parameter('debug_topic').value)
+        debug_raw_topic = str(self.get_parameter('debug_raw_topic').value)
+        debug_bev_topic = str(self.get_parameter('debug_bev_topic').value)
         control_topic = str(self.get_parameter('control_topic').value)
         self.publish_debug = bool(self.get_parameter('publish_debug').value)
         self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
@@ -84,14 +87,16 @@ class LaneNode(Node):
         self.subscription = self.create_subscription(
             CompressedImage, image_topic, self.image_callback, 10)
         self.publisher = self.create_publisher(LaneState, lane_topic, 10)
-        self.debug_pub = self.create_publisher(CompressedImage, debug_topic, 10)
+        self.debug_raw_pub = self.create_publisher(CompressedImage, debug_raw_topic, 10)
+        self.debug_bev_pub = self.create_publisher(CompressedImage, debug_bev_topic, 10)
         self.control_pub = self.create_publisher(Control, control_topic, 10)
 
         self.prev_offset = 0.0
 
         self.get_logger().info(
             f'lane_node started: image_topic={image_topic}, lane_topic={lane_topic}, '
-            f'debug_topic={debug_topic}, publish_debug={self.publish_debug}'
+            f'debug_raw={debug_raw_topic}, debug_bev={debug_bev_topic}, '
+            f'publish_debug={self.publish_debug}'
         )
 
     # ------------------------------------------------------------------ #
@@ -320,39 +325,37 @@ class LaneNode(Node):
                 cv2.circle(img, (int(b['right']), y), 3, (0, 0, 255), -1)   # 빨강
             cv2.circle(img, (int(b['center']), y), 3, (0, 255, 255), -1)    # 노랑
 
+    def _encode_publish(self, image, publisher, source_msg, frame_id):
+        ok, encoded = cv2.imencode(
+            '.jpg', image, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+        if not ok:
+            return
+        out = CompressedImage()
+        out.header.stamp = source_msg.header.stamp
+        out.header.frame_id = frame_id
+        out.format = 'jpeg'
+        out.data = encoded.tobytes()
+        publisher.publish(out)
+
     # ------------------------------------------------------------------ #
-    #  디버그 오버레이: BEV면 [원본+사다리꼴 | 펼친 BEV+검출점], 아니면 ROI 단일
+    #  디버그 2장: raw(원본+사다리꼴) / bev(펼친 BEV+검출점) 별도 토픽 발행
     # ------------------------------------------------------------------ #
     def _publish_debug(self, roi, analysis_img, bev_src, bands, state, source_msg):
         text = (f"det={state.detected} off={state.offset:+.2f} "
                 f"ang={state.angle:+.2f} conf={state.confidence:.2f}")
 
+        # raw 패널: 원본 ROI + 사다리꼴(초록) + 상태 텍스트
+        raw = roi.copy()
         if bev_src is not None:
-            # 왼쪽: 원본 ROI에 사다리꼴(초록)만 그려 원근영역 확인
-            left = roi.copy()
-            cv2.polylines(left, [bev_src.astype(np.int32)], True, (0, 255, 0), 1)
-            # 오른쪽: 펼친 BEV에 검출점
-            right = analysis_img.copy()
-            self._draw_bands(right, bands)
-            cv2.putText(left, text, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                        (0, 255, 0), 1, cv2.LINE_AA)
-            overlay = cv2.hconcat([left, right])
-        else:
-            overlay = roi.copy()
-            self._draw_bands(overlay, bands)
-            cv2.putText(overlay, text, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                        (0, 255, 0), 1, cv2.LINE_AA)
+            cv2.polylines(raw, [bev_src.astype(np.int32)], True, (0, 255, 0), 1)
+        cv2.putText(raw, text, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                    (0, 255, 0), 1, cv2.LINE_AA)
+        self._encode_publish(raw, self.debug_raw_pub, source_msg, 'lane_debug_raw')
 
-        ok, encoded = cv2.imencode(
-            '.jpg', overlay, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
-        if not ok:
-            return
-        out = CompressedImage()
-        out.header.stamp = source_msg.header.stamp
-        out.header.frame_id = 'lane_debug'
-        out.format = 'jpeg'
-        out.data = encoded.tobytes()
-        self.debug_pub.publish(out)
+        # bev 패널: 펼친 BEV(또는 BEV off면 ROI) + 검출점
+        bev = analysis_img.copy()
+        self._draw_bands(bev, bands)
+        self._encode_publish(bev, self.debug_bev_pub, source_msg, 'lane_debug_bev')
 
 
 def main(args=None):

@@ -91,7 +91,7 @@ def generate_launch_description():
             parameters=[
                 {
                     'vehicle_config_file': vehicle_config_path,
-                    'steer_kp': 3,
+                    'steer_kp': 1.5,
                     'steer_kd': 0.3,
                     'steer_ka': 0.0,
                     'steering_sign': -1.0,
@@ -141,7 +141,8 @@ def generate_launch_description():
                 {
                     'vehicle_config_file': vehicle_config_path,
                     'debug_image': True,
-                    'opencv_grayscale_topic': '/lane/debug/compressed',
+                    'opencv_grayscale_topic': '/lane/debug/raw',   # 원본+사다리꼴
+                    'opencv_blur_topic': '/lane/debug/bev',        # 펼친 BEV+검출점
                 },
             ],
         ),
