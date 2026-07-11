@@ -243,9 +243,12 @@ class JoystickNode(Node):
     def update_e_stop_from_buttons(self, data):
         x_pressed = bool(data.button_x)
 
-        if x_pressed and not self._prev_x_pressed and not self.e_stop_latched:
-            self.e_stop_latched = True
-            self.get_logger().warning('E-STOP latched by joystick X button')
+        if x_pressed and not self._prev_x_pressed:
+            self.e_stop_latched = not self.e_stop_latched
+            if self.e_stop_latched:
+                self.get_logger().warning('E-STOP latched by joystick X button')
+            else:
+                self.get_logger().warning('E-STOP released by joystick X button')
 
         self._prev_x_pressed = x_pressed
 
@@ -355,7 +358,6 @@ class JoystickNode(Node):
             self.throttle_deadzone,
         )
         throttle = self.clamp(throttle_axis * self.accel_ratio)
-        throttle = max(0.0, throttle)
 
         steering = self.deadzone(
             self.read_steering_axis(data),

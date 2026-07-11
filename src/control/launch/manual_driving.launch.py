@@ -37,6 +37,7 @@ def generate_launch_description():
                 {
                     'calibration_mode': True,
                     'vehicle_config_file': vehicle_config_path,
+                    'throttle_scale': 0.2,  # 수동 시작 시 초기 accel_ratio
                 },
             ],
         ),
