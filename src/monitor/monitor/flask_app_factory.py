@@ -1,5 +1,6 @@
 from pathlib import Path
 import threading
+import time
 
 try:
     from flask import Flask, Response, jsonify, render_template, send_file
@@ -95,6 +96,62 @@ def create_app( state, page_title,
             build_camera_placeholder_svg(image_display_width, image_display_height, image_topic),
             mimetype='image/svg+xml',
         )
+
+    def mjpeg_stream(frame_seq_provider):
+        # Pushes each new JPEG frame exactly once as an MJPEG (multipart) stream.
+        # Avoids per-frame HTTP polling so the browser stays in sync at the
+        # publish rate (~30 fps) with minimal latency.
+        boundary = b'--frame\r\n'
+        last_seq = None
+        idle_frames = 0
+        while True:
+            frame_bytes, seq = frame_seq_provider()
+            if frame_bytes is None or seq == last_seq:
+                # Wait briefly for the next frame instead of busy-spinning.
+                time.sleep(0.005)
+                idle_frames += 1
+                # Periodic keep-alive comment so proxies keep the socket open.
+                if idle_frames >= 600:
+                    idle_frames = 0
+                    yield b'--frame\r\nContent-Type: text/plain\r\n\r\n\r\n'
+                continue
+            last_seq = seq
+            idle_frames = 0
+            yield (
+                boundary
+                + b'Content-Type: image/jpeg\r\n'
+                + b'Content-Length: ' + str(len(frame_bytes)).encode('ascii') + b'\r\n\r\n'
+                + frame_bytes
+                + b'\r\n'
+            )
+
+    def make_stream_response(frame_seq_provider):
+        return Response(
+            mjpeg_stream(frame_seq_provider),
+            mimetype='multipart/x-mixed-replace; boundary=frame',
+            headers={
+                'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+                'Pragma': 'no-cache',
+                'Connection': 'close',
+                'X-Accel-Buffering': 'no',
+            },
+        )
+
+    @app.get('/api/stream')
+    def api_stream():
+        return make_stream_response(state.get_latest_frame_seq)
+
+    @app.get('/api/stream/grayscale')
+    def api_stream_grayscale():
+        return make_stream_response(lambda: state.get_debug_frame_seq('grayscale'))
+
+    @app.get('/api/stream/blur')
+    def api_stream_blur():
+        return make_stream_response(lambda: state.get_debug_frame_seq('blur'))
+
+    @app.get('/api/stream/edge')
+    def api_stream_edge():
+        return make_stream_response(lambda: state.get_debug_frame_seq('edge'))
 
     @app.get('/api/frame/grayscale')
     def api_frame_grayscale():

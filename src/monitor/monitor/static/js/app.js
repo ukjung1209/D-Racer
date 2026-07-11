@@ -22,9 +22,13 @@ const config = window.MONITOR_CONFIG || {
   statusEndpoint: '/api/status',
   graphEndpoint: '/api/graph',
   frameEndpoint: '/api/frame',
+  streamEndpoint: '/api/stream',
   debugFrameGrayscaleEndpoint: '/api/frame/grayscale',
   debugFrameBlurEndpoint: '/api/frame/blur',
   debugFrameEdgeEndpoint: '/api/frame/edge',
+  debugStreamGrayscaleEndpoint: '/api/stream/grayscale',
+  debugStreamBlurEndpoint: '/api/stream/blur',
+  debugStreamEdgeEndpoint: '/api/stream/edge',
   debugImageEnabled: false,
   placeholderUrl: '/api/frame/placeholder',
   refreshIntervalMs: 1000,
@@ -511,65 +515,46 @@ async function fetchStatus() {
   }
 }
 
-function refreshCameraFrame() {
-  if (imageRequestInFlight) {
-    return;
-  }
-
-  imageRequestInFlight = true;
-
-  const image = new Image();
-  image.onload = () => {
-    elements.cameraFrame.src = image.src;
-    imageRequestInFlight = false;
-  };
-  image.onerror = () => {
-    elements.cameraFrame.src = config.placeholderUrl;
-    imageRequestInFlight = false;
-  };
-  image.src = `${config.frameEndpoint}?t=${Date.now()}`;
-}
-
-function refreshImageByEndpoint(targetElement, endpoint) {
+function attachStream(targetElement, streamEndpoint) {
   if (!targetElement) {
     return;
   }
 
-  const image = new Image();
-  image.onload = () => {
-    targetElement.src = image.src;
+  const connect = () => {
+    // Cache-bust so a reconnect opens a fresh MJPEG stream, not a cached one.
+    targetElement.src = `${streamEndpoint}?t=${Date.now()}`;
   };
-  image.onerror = () => {
+
+  targetElement.onerror = () => {
+    // Stream dropped (server restart / network hiccup): show placeholder, retry.
     targetElement.src = config.placeholderUrl;
+    window.setTimeout(connect, 1000);
   };
-  image.src = `${endpoint}?t=${Date.now()}`;
+
+  connect();
 }
 
-function refreshDebugFrames() {
-  if (!config.debugImageEnabled || debugImageRequestInFlight) {
+function startCameraStream() {
+  attachStream(elements.cameraFrame, config.streamEndpoint);
+}
+
+function startDebugStreams() {
+  if (!config.debugImageEnabled) {
     return;
   }
 
-  debugImageRequestInFlight = true;
-  refreshImageByEndpoint(elements.debugFrameGrayscale, config.debugFrameGrayscaleEndpoint);
-  refreshImageByEndpoint(elements.debugFrameBlur, config.debugFrameBlurEndpoint);
-  refreshImageByEndpoint(elements.debugFrameEdge, config.debugFrameEdgeEndpoint);
-  debugImageRequestInFlight = false;
+  attachStream(elements.debugFrameGrayscale, config.debugStreamGrayscaleEndpoint);
+  attachStream(elements.debugFrameBlur, config.debugStreamBlurEndpoint);
+  attachStream(elements.debugFrameEdge, config.debugStreamEdgeEndpoint);
 }
 
 function startPolling() {
   fetchStatus();
   fetchGraph();
-  refreshCameraFrame();
-  if (config.debugImageEnabled) {
-    refreshDebugFrames();
-  }
+  startCameraStream();
+  startDebugStreams();
   window.setInterval(fetchStatus, config.refreshIntervalMs);
   window.setInterval(fetchGraph, config.refreshIntervalMs);
-  window.setInterval(refreshCameraFrame, config.imageRefreshIntervalMs);
-  if (config.debugImageEnabled) {
-    window.setInterval(refreshDebugFrames, config.imageRefreshIntervalMs);
-  }
 }
 
 document.addEventListener('DOMContentLoaded', startPolling);

@@ -13,6 +13,7 @@ class MonitorState:
         self._battery_updated_monotonic = None
 
         self._image_frame = None
+        self._image_seq = 0
         self._image_width = image_source_width
         self._image_height = image_source_height
         self._image_updated_at = None
@@ -21,6 +22,11 @@ class MonitorState:
             'grayscale': None,
             'blur': None,
             'edge': None,
+        }
+        self._debug_seq = {
+            'grayscale': 0,
+            'blur': 0,
+            'edge': 0,
         }
         self._debug_widths = {
             'grayscale': image_source_width,
@@ -81,6 +87,7 @@ class MonitorState:
     def update_image(self, frame_bytes, source_width, source_height):
         with self._lock:
             self._image_frame = frame_bytes
+            self._image_seq += 1
             self._image_width = int(source_width)
             self._image_height = int(source_height)
             self._image_updated_at = datetime.now(timezone.utc)
@@ -102,6 +109,7 @@ class MonitorState:
 
         with self._lock:
             self._debug_frames[image_key] = frame_bytes
+            self._debug_seq[image_key] += 1
             self._debug_widths[image_key] = int(source_width)
             self._debug_heights[image_key] = int(source_height)
             self._debug_updated_at[image_key] = datetime.now(timezone.utc)
@@ -130,9 +138,17 @@ class MonitorState:
         with self._lock:
             return self._image_frame
 
+    def get_latest_frame_seq(self):
+        with self._lock:
+            return self._image_frame, self._image_seq
+
     def get_debug_frame(self, image_key):
         with self._lock:
             return self._debug_frames.get(image_key)
+
+    def get_debug_frame_seq(self, image_key):
+        with self._lock:
+            return self._debug_frames.get(image_key), self._debug_seq.get(image_key, 0)
 
     def snapshot(self):
         with self._lock:

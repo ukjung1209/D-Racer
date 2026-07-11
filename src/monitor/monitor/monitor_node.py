@@ -9,6 +9,7 @@ from joystick_msgs.msg import Joystick
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage
 import yaml
 
@@ -160,6 +161,14 @@ class MonitorNode(Node):
         )
         self.server_thread = FlaskServerThread(self.app, self.web_host, self.web_port)
 
+        # Keep only the newest frame so a momentarily slow web thread never
+        # accumulates a backlog of stale images (fixes growing display latency).
+        image_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+        )
+
         self.create_subscription(
             Battery,
             self.battery_topic,
@@ -170,26 +179,26 @@ class MonitorNode(Node):
             CompressedImage,
             self.image_topic,
             self.image_callback,
-            10,
+            image_qos,
         )
         if self.debug_image:
             self.create_subscription(
                 CompressedImage,
                 self.opencv_grayscale_topic,
                 self.debug_grayscale_callback,
-                10,
+                image_qos,
             )
             self.create_subscription(
                 CompressedImage,
                 self.opencv_blur_topic,
                 self.debug_blur_callback,
-                10,
+                image_qos,
             )
             self.create_subscription(
                 CompressedImage,
                 self.opencv_edge_topic,
                 self.debug_edge_callback,
-                10,
+                image_qos,
             )
         self.create_subscription(
             Control,
