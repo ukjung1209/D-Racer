@@ -3,7 +3,7 @@
 파이프라인:  camera → lane_node(/lane/state) → decision_node(/control) → control_node → PWM
 
 기본:  camera_node + lane_node + monitor_node  (바퀴 안 움직임, 검출만)
-  → 대시보드(grayscale 패널)에 /lane/debug/compressed 오버레이가 뜬다.
+  → 대시보드 GRAYSCALE=/lane/debug/raw(원본+사다리꼴), BLUR=/lane/debug/bev(펼친 BEV).
   → `ros2 param set /lane_node <param> <value>` 로 검출 실시간 튜닝.
 
 차선추종 주행:  `ros2 launch inference lane_test.launch.py drive:=true`
@@ -59,7 +59,7 @@ def generate_launch_description():
             ],
         ),
 
-        # 차선 검출 → /lane/state 발행 (+ /lane/debug/compressed 오버레이)
+        # 차선 검출 → /lane/state 발행 (+ /lane/debug/raw, /lane/debug/bev 오버레이)
         Node(
             package='inference',
             executable='lane_node',
@@ -109,13 +109,14 @@ def generate_launch_description():
             condition=IfCondition(drive),
             parameters=[
                 {
-                    'use_joystick_control': False,
+                    'use_joystick_control': True,  # 시작은 수동(안전). A버튼으로 자동 전환
+                    'mode_toggle_enable': True,    # A버튼 수동/자동 토글 허용
                     'vehicle_config_file': vehicle_config_path,
                 },
             ],
         ),
 
-        # E-STOP(조이스틱 X)용 — 주행 모드에서만
+        # E-STOP(X)/모드토글(A)용 — 주행 모드에서만
         Node(
             package='joystick',
             executable='joystick_node',
@@ -125,6 +126,7 @@ def generate_launch_description():
             parameters=[
                 {
                     'calibration_mode': False,
+                    'manual_mode_start': True,    # 시작은 수동(안전). A로 자동 전환
                     'vehicle_config_file': vehicle_config_path,
                 },
             ],

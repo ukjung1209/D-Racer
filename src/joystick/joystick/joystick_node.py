@@ -10,6 +10,8 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 import yaml
 
+from std_msgs.msg import Bool
+
 from control_msgs.msg import Control
 from joystick_msgs.msg import Joystick
 from topst_utils.gamepads import ShanWanGamepad
@@ -55,6 +57,9 @@ class JoystickNode(Node):
         self.declare_parameter('accel_ratio_max', 0.4)
         self.declare_parameter('debug_log_enable', True)
         self.declare_parameter('debug_log_hz', 5.0)
+        # A버튼 수동/자동 토글: 시작 모드(True=수동)와 발행 토픽
+        self.declare_parameter('manual_mode_topic', 'manual_mode')
+        self.declare_parameter('manual_mode_start', True)
 
         publish_topic = str(self.get_parameter('publish_topic').value)
         publish_hz = float(self.get_parameter('publish_hz').value)
@@ -79,6 +84,8 @@ class JoystickNode(Node):
         self.accel_ratio_max = float(self.get_parameter('accel_ratio_max').value)
         self.debug_log_enable = bool(self.get_parameter('debug_log_enable').value)
         self.debug_log_hz = float(self.get_parameter('debug_log_hz').value)
+        manual_mode_topic = str(self.get_parameter('manual_mode_topic').value)
+        self.manual_mode = bool(self.get_parameter('manual_mode_start').value)
         self.publish_hz = publish_hz
 
         if self.accel_ratio_min > self.accel_ratio_max:
@@ -95,6 +102,7 @@ class JoystickNode(Node):
         self._prev_y_pressed = False
         self._prev_b_pressed = False
         self._prev_x_pressed = False
+        self._prev_a_pressed = False
         self._prev_start_pressed = False
         self.e_stop_latched = False
         self.is_recording = False
@@ -108,6 +116,7 @@ class JoystickNode(Node):
         self.load_saved_calibration()
 
         self.joystick_pub = self.create_publisher(Joystick, publish_topic, 10)
+        self.manual_mode_pub = self.create_publisher(Bool, manual_mode_topic, 10)
         self.gamepad = ShanWanGamepad()
         self.latest_input = None
         self.lock = threading.Lock()
@@ -252,6 +261,16 @@ class JoystickNode(Node):
 
         self._prev_x_pressed = x_pressed
 
+    def update_manual_mode_from_buttons(self, data):
+        a_pressed = bool(data.button_a)
+
+        if a_pressed and not self._prev_a_pressed:
+            self.manual_mode = not self.manual_mode
+            mode = 'MANUAL(joystick)' if self.manual_mode else 'AUTO(decision_node)'
+            self.get_logger().warning(f'Drive mode toggled by A button -> {mode}')
+
+        self._prev_a_pressed = a_pressed
+
     def start_recording(self):
         if self.recording_process is not None and self.recording_process.poll() is None:
             self.is_recording = True
@@ -337,6 +356,7 @@ class JoystickNode(Node):
                 self.update_accel_ratio_from_buttons(data)
                 self.update_steering_trim_from_buttons(data)
                 self.update_e_stop_from_buttons(data)
+                self.update_manual_mode_from_buttons(data)
                 self.update_recording_from_buttons(data)
                 with self.lock:
                     self.latest_input = data
@@ -386,6 +406,8 @@ class JoystickNode(Node):
         msg.e_stop_en = bool(self.e_stop_latched)
         msg.is_recording = bool(self.is_recording)
         self.joystick_pub.publish(msg)
+
+        self.manual_mode_pub.publish(Bool(data=bool(self.manual_mode)))
 
     def debug_timer_callback(self):
         with self.lock:

@@ -5,10 +5,9 @@ import rclpy
 from rclpy.node import Node
 import yaml
 
-from std_msgs.msg import Bool
-
 from control_msgs.msg import Control
 from joystick_msgs.msg import Joystick
+from std_msgs.msg import Bool
 from topst_utils.d3racer import D3Racer
 
 
@@ -31,9 +30,6 @@ class ControlNode(Node):
         self.declare_parameter('throttle_channel', 1)
         self.declare_parameter('vehicle_config_file', get_default_vehicle_config_path())
         self.declare_parameter('use_joystick_control', False)
-        # A버튼 수동/자동 토글: True면 /manual_mode(Bool)로 use_joystick_control을 런타임 전환
-        self.declare_parameter('mode_toggle_enable', False)
-        self.declare_parameter('manual_mode_topic', 'manual_mode')
         self.declare_parameter('joystick_topic', 'joystick')
         self.declare_parameter('control_topic', '/control')
         self.declare_parameter('command_hz', 10.0)
@@ -57,8 +53,6 @@ class ControlNode(Node):
             str(self.get_parameter('vehicle_config_file').value)
         )
         self.use_joystick_control = bool(self.get_parameter('use_joystick_control').value)
-        self.mode_toggle_enable = bool(self.get_parameter('mode_toggle_enable').value)
-        manual_mode_topic = str(self.get_parameter('manual_mode_topic').value)
         joystick_topic = str(self.get_parameter('joystick_topic').value)
         control_topic = str(self.get_parameter('control_topic').value)
         command_hz = float(self.get_parameter('command_hz').value)
@@ -112,14 +106,6 @@ class ControlNode(Node):
             self.control_callback,
             10,
         )
-        # A버튼 수동/자동 토글 활성화 시에만 모드 토픽 구독
-        if self.mode_toggle_enable:
-            self.create_subscription(
-                Bool,
-                manual_mode_topic,
-                self.manual_mode_callback,
-                10,
-            )
 
         # Command output loop
         self.timer = self.create_timer(1.0 / self.command_hz, self.timer_callback)
@@ -178,16 +164,6 @@ class ControlNode(Node):
 
         self.steering = float(msg.steering)
         self.throttle = float(msg.throttle)
-
-    def manual_mode_callback(self, msg: Bool):
-        # True=수동(조이스틱 스틱), False=자동(decision_node의 /control)
-        new_mode = bool(msg.data)
-        if new_mode != self.use_joystick_control:
-            src = 'joystick(manual)' if new_mode else 'decision_node(auto)'
-            self.get_logger().warning(f'Control source switched to {src}')
-            # 전환 순간 이전 명령이 남지 않도록 중립 처리
-            self.throttle = 0.0
-        self.use_joystick_control = new_mode
 
     def engage_e_stop(self):
         if self.e_stop_active:
