@@ -92,6 +92,7 @@ class LaneNode(Node):
         self.control_pub = self.create_publisher(Control, control_topic, 10)
 
         self.prev_offset = 0.0
+        self.prev_center = None   # 직전 프레임 차선중심 (좌/우 오분류 방지용 시드)
 
         self.get_logger().info(
             f'lane_node started: image_topic={image_topic}, lane_topic={lane_topic}, '
@@ -170,11 +171,14 @@ class LaneNode(Node):
     # ------------------------------------------------------------------ #
     #  가로 밴드별로 좌/우 라인 분리 → 차선 중심 추정 (아래→위 전파)
     # ------------------------------------------------------------------ #
-    def _analyze_bands(self, mask, width, num_bands, min_pixels, split_gap, half_width):
+    def _analyze_bands(self, mask, width, num_bands, min_pixels, split_gap,
+                       half_width, seed_center):
         h = mask.shape[0]
         band_h = max(1, h // num_bands)
         bands = []
-        running_center = width / 2.0   # 시작 사전값: 차가 중앙에 있다고 가정
+        # 맨 아래 밴드의 좌/우 판정 기준. 직전 프레임 중심으로 시드하면
+        # 커브에서 라인이 화면중앙을 넘어와도 같은 쪽으로 계속 인식한다.
+        running_center = seed_center
 
         # 아래(차에 가까운 쪽)부터 위로 올라가며 처리
         for i in range(num_bands):
@@ -249,10 +253,14 @@ class LaneNode(Node):
             analysis_img, bev_src = roi, None
 
         mask = self._build_mask(analysis_img, lane_color)
+        seed_center = self.prev_center if self.prev_center is not None else width / 2.0
         bands = self._analyze_bands(
-            mask, width, num_bands, min_pixels, split_gap, half_width)
+            mask, width, num_bands, min_pixels, split_gap, half_width, seed_center)
 
         valid = [b for b in bands if b['valid']]
+
+        # 다음 프레임 시드: 가장 아래(가까운) 밴드 중심. 차선 잃으면 중앙으로 리셋.
+        self.prev_center = valid[0]['center'] if valid else None
 
         state = LaneState()
         state.header.stamp = self.get_clock().now().to_msg()
