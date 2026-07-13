@@ -7,11 +7,12 @@
   → `ros2 param set /lane_node <param> <value>` 로 검출 실시간 튜닝.
 
 차선추종 주행:  `ros2 launch inference lane_test.launch.py drive:=true`
-  → decision_node + control_node + joystick_node(E-STOP)를 추가로 띄운다.
-  → lane_node는 /lane/state만 발행하고, decision_node가 PD로 /control을 만든다.
+  → decision_arrow_node + control_node + joystick_node(E-STOP)를 추가로 띄운다.
+  → lane_node는 /lane/state만 발행하고, decision_arrow_node가 PD로 /control을 만든다.
+    (여기선 object_node가 없어 갈림길 미션은 꺼두고 순수 차선추종만 한다.)
   → ⚠️ 바퀴를 먼저 띄우고 확인할 것. 반대로 꺾이면
-     `ros2 param set /decision_node steering_sign 1.0`.
-  → 조향 게인 튜닝: `ros2 param set /decision_node steer_kp 1.0` 등.
+     `ros2 param set /decision_arrow_node steering_sign 1.0`.
+  → 조향 게인 튜닝: `ros2 param set /decision_arrow_node steer_kp 1.0` 등.
 """
 
 from pathlib import Path
@@ -76,6 +77,12 @@ def generate_launch_description():
                     'num_bands': 10,
                     'line_split_gap_px': 40,
                     'lane_half_width_px': 90,
+                    # --- BEV 사다리꼴 (실트랙 튜닝값) ---
+                    'bev_top_left': 0.25,
+                    'bev_top_right': 0.75,
+                    'bev_top_y': 0.32,
+                    'bev_bottom_left': 0.05,
+                    'bev_bottom_right': 0.95,
                     'publish_debug': True,
                 },
             ],
@@ -84,18 +91,19 @@ def generate_launch_description():
         # /lane/state → PD 차선추종 → /control (주행 모드에서만)
         Node(
             package='inference',
-            executable='decision_node',
-            name='decision_node',
+            executable='decision_arrow_node',
+            name='decision_arrow_node',
             output='screen',
             condition=IfCondition(drive),
             parameters=[
                 {
                     'vehicle_config_file': vehicle_config_path,
-                    'steer_kp': 1.5,
-                    'steer_kd': 0.3,
+                    'steer_kp': 0.8,
+                    'steer_kd': 0.4,
                     'steer_ka': 0.0,
                     'steering_sign': -1.0,
                     'base_throttle': 0.15,
+                    'enable_fork_mission': False,  # object_node 없음 → 순수 차선추종
                 },
             ],
         ),
