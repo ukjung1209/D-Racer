@@ -69,10 +69,12 @@ def generate_launch_description():
             parameters=[
                 {
                     'vehicle_config_file': vehicle_config_path,
-                    # --- 회색 트랙 오렌지 라인 튜닝값 (2026-07-03 실측) ---
-                    'lane_color': 'orange',
-                    'hsv_lower': [8.0, 90.0, 90.0],
-                    'hsv_upper': [26.0, 255.0, 255.0],
+                    # --- 회색 트랙 흰색 라인: 밝기 임계값으로 검출 ---
+                    # 흰 선은 색(HSV)이 아니라 밝기로 잡는다. 회색 매트보다
+                    # 흰 선이 밝으므로 binary_threshold 위쪽만 남긴다.
+                    # 조명 따라 트랙에서 실측 튜닝: ros2 param set /lane_node binary_threshold <값>
+                    'lane_color': 'white',
+                    'binary_threshold': 180,
                     'roi_top_px': 45,
                     'num_bands': 10,
                     'line_split_gap_px': 40,

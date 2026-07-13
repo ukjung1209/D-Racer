@@ -23,9 +23,10 @@ def get_default_vehicle_config_path():
 class LaneNode(Node):
     """카메라 이미지에서 차선을 검출해 /lane/state로 발행한다.
 
-    트랙은 회색 매트 + 오렌지 사이드 라인이라 오렌지 HSV 마스크를 쓴다.
+    트랙은 회색 매트 + 흰색 사이드 라인이라 밝기 이진화 마스크를 쓴다
+    (lane_color='white', binary_threshold 위쪽만 남김. 오렌지 트랙이면 'orange' HSV로 전환).
     ROI를 자른 뒤 버드아이뷰(BEV)로 원근을 펴고(bev_enable), 가로 밴드마다
-    오렌지 픽셀을 좌/우 라인으로 나눠 차선 중심을 잡는다. 결과는 offset(좌우 오차),
+    차선 픽셀을 좌/우 라인으로 나눠 차선 중심을 잡는다. 결과는 offset(좌우 오차),
     angle(기울기), confidence로 발행하고, 디버그 오버레이(/lane/debug/compressed)는
     [원본+사다리꼴 | 펼친 BEV+검출점]을 나란히 보여줘 사다리꼴 보정을 돕는다.
     publish_control=True면 테스트용 PD 조향을 직접 /control로 보낸다.
@@ -44,7 +45,7 @@ class LaneNode(Node):
         self.declare_parameter('vehicle_config_file', get_default_vehicle_config_path())
 
         # --- 검출 튜닝 파라미터 (매 프레임 다시 읽어 live 튜닝 가능) ---
-        self.declare_parameter('lane_color', 'orange')          # orange | white | dark
+        self.declare_parameter('lane_color', 'white')           # orange | white | dark
         self.declare_parameter('hsv_lower', [8.0, 90.0, 90.0])
         self.declare_parameter('hsv_upper', [26.0, 255.0, 255.0])
         self.declare_parameter('binary_threshold', 160)         # white/dark 모드용
@@ -55,13 +56,13 @@ class LaneNode(Node):
         self.declare_parameter('lane_half_width_px', 90)        # 한쪽만 보일 때 반대편 추정
 
         # --- 버드아이뷰(BEV) 원근변환: ROI 폭/높이 비율(0~1)로 사다리꼴 4점 지정 ---
-        # 사다리꼴 양 옆변이 두 오렌지 선을 그대로 덮도록 맞춰야 BEV가 편다.
+        # 사다리꼴 양 옆변이 두 차선을 그대로 덮도록 맞춰야 BEV가 편다.
         self.declare_parameter('bev_enable', True)
-        self.declare_parameter('bev_top_left', 0.28)      # 윗변 좌 = 위쪽 오렌지 선 위치
-        self.declare_parameter('bev_top_right', 0.72)     # 윗변 우 = 위쪽 오렌지 선 위치
+        self.declare_parameter('bev_top_left', 0.28)      # 윗변 좌 = 위쪽 차선 위치
+        self.declare_parameter('bev_top_right', 0.72)     # 윗변 우 = 위쪽 차선 위치
         self.declare_parameter('bev_top_y', 0.32)         # 윗변 y (ROI 높이 비율) — 배경 제외
-        self.declare_parameter('bev_bottom_left', 0.0)    # 아랫변 좌 = 아래쪽 오렌지 선 위치
-        self.declare_parameter('bev_bottom_right', 1.0)   # 아랫변 우 = 아래쪽 오렌지 선 위치
+        self.declare_parameter('bev_bottom_left', 0.0)    # 아랫변 좌 = 아래쪽 차선 위치
+        self.declare_parameter('bev_bottom_right', 1.0)   # 아랫변 우 = 아래쪽 차선 위치
 
         # --- 테스트 조향(PD) 파라미터 ---
         self.declare_parameter('publish_control', False)
