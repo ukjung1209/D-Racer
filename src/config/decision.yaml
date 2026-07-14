@@ -67,7 +67,8 @@ lane_node:
   ros__parameters:
     lane_color: 'white'
     white_s_max: 20             # 채도 상한↓ = 색깔 배제. 40→20: 푸르스름한 트랙 무늬(반사) 오검출 배제
-    white_v_min: 120            # 명도 하한↑ = 완전 흰색만
+    white_v_min: 120            # 명도 하한 절대 바닥 (흰선 없는 프레임에서 매트 안 잡히게)
+    white_v_percentile: 98.0    # (mod 5) V 하한을 프레임 상위 이 백분위로 적응 조정 (밝은 매트 배제). ↓=더 관대
     white_tophat_ksize: 21      # 글레어 남으면 ↓, 차선 끊기면 ↑ (0=끔)
     white_tophat_min: 18
     roi_top_px: 45

@@ -56,7 +56,9 @@ class LaneNode(Node):
         self.declare_parameter('binary_threshold', 160)         # dark 모드용
         # white 모드: 채도 낮고(색 없음) 명도 높은(밝은) 픽셀 = 진짜 흰색만
         self.declare_parameter('white_s_max', 40)               # 채도 상한 (낮을수록 회색·색깔 배제)
-        self.declare_parameter('white_v_min', 200)              # 명도 하한 (높을수록 완전 흰색만)
+        self.declare_parameter('white_v_min', 200)              # 명도 하한 절대 바닥(흰선 없는 프레임 보호)
+        # (mod 5) V 하한을 프레임 밝기 상위 백분위로 적응 조정 → 밝은 매트 배제
+        self.declare_parameter('white_v_percentile', 98.0)
         # 빛반사 억제: top-hat은 '커널보다 작은 밝은 구조'(얇은 차선)만 남기고
         # 넓고 부드러운 밝은 덩어리(글레어)는 없앤다. 밝기 절대값이 아니라 국소
         # 대비를 보므로 어두운 프레임의 흰선도 그대로 산다. 0이면 끔.
@@ -179,7 +181,12 @@ class LaneNode(Node):
             # 밝기만 보면 밝은 회색 매트도 잡히므로 HSV로 색 없는 밝은 픽셀만 고른다.
             hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
             s_max = int(self.get_parameter('white_s_max').value)
-            v_min = int(self.get_parameter('white_v_min').value)
+            # (mod 5) V 하한을 프레임의 상위 백분위로 적응 조정: 흰선이 있으면 그 밝기
+            # 근처만 통과시켜 밝은 회색 매트를 배제한다. 흰 픽셀이 없는 프레임에선
+            # 백분위가 매트 밝기라 낮아지므로, 절대 하한 white_v_min으로 바닥을 받친다.
+            v_pct = float(self.get_parameter('white_v_percentile').value)
+            v_min = int(max(int(self.get_parameter('white_v_min').value),
+                            np.percentile(hsv[:, :, 2], v_pct)))
             lower = np.array([0, 0, v_min], dtype=np.uint8)
             upper = np.array([180, s_max, 255], dtype=np.uint8)
             mask = cv2.inRange(hsv, lower, upper)
