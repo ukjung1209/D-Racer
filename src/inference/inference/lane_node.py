@@ -12,6 +12,8 @@ from std_msgs.msg import Int8
 from control_msgs.msg import Control
 from inference_msgs.msg import LaneState
 
+from inference import lane_core
+
 
 def get_default_vehicle_config_path():
     for base_path in Path(__file__).resolve().parents:
@@ -65,6 +67,11 @@ class LaneNode(Node):
         self.declare_parameter('min_band_pixels', 12)
         self.declare_parameter('line_split_gap_px', 40)         # 좌/우 라인 분리 gap
         self.declare_parameter('lane_half_width_px', 90)        # 한쪽만 보일 때 반대편 추정
+        # 클러스터 검증(mod 1): 배정 전 십자 가로획/잡음 조각을 거른다.
+        self.declare_parameter('cluster_max_width_px', 60)      # BEV 차선폭 ~2.5배. 넘으면 가로획으로 보고 버림
+        self.declare_parameter('cluster_min_pixels', 30)        # 실제 흰 픽셀 수 하한(잡음 조각 배제)
+        # 앵커 게이트: 최근접이라도 |cx−앵커| > half_width·gate_ratio면 배정 안 함(오배정 차단)
+        self.declare_parameter('anchor_gate_ratio', 0.4)
         # 갈림길 hugging bias: 추종할 라인에서 이만큼만 안쪽으로 붙는다(작을수록 라인에 밀착)
         self.declare_parameter('hug_bias_px', 45)
         # hugging 중 추종 라인이 '안쪽(중앙)'으로 이 픽셀보다 확 튀면 = 라인 사라지고
@@ -218,116 +225,18 @@ class LaneNode(Node):
         return warped, src
 
     # ------------------------------------------------------------------ #
-    #  가로 밴드별로 좌/우 라인 분리 → 차선 중심 추정 (아래→위 전파)
+    #  가로 밴드 분석 → lane_core 위임 (ROS 파라미터만 읽어 순수 함수로 넘김)
     # ------------------------------------------------------------------ #
     def _analyze_bands(self, mask, width, num_bands, min_pixels, split_gap,
                        half_width, seed_center, seed_left, seed_right,
                        branch_hint, hug_bias, hug_line_seed, hug_track_tol):
-        h = mask.shape[0]
-        band_h = max(1, h // num_bands)
-        bands = []
-        # per-line 앵커: 직전 프레임의 좌/우 라인 x로 시드한다. 한쪽 라인만 보일 때
-        # '중심 대비 좌/우'가 아니라 '어느 라인에 더 가까운가'로 판정하므로,
-        # 커브에서 라인이 화면중앙을 넘어와도 같은 라인으로 계속 인식된다.
-        running_left = seed_left
-        running_right = seed_right
-        running_center = seed_center   # 앵커가 아직 없을 때(cold start)만 쓰는 폴백
-        running_line = hug_line_seed   # hugging 중 추종하는 라인 x (밴드 아래→위 연속)
-
-        # 아래(차에 가까운 쪽)부터 위로 올라가며 처리
-        for i in range(num_bands):
-            y1 = h - i * band_h
-            y0 = max(0, y1 - band_h)
-            if y1 <= 0:
-                break
-            band = mask[y0:y1, :]
-            xs = np.nonzero(band.any(axis=0))[0]     # 마스크 픽셀이 있는 열 인덱스
-            if xs.size < min_pixels:
-                bands.append({'valid': False, 'y': (y0 + y1) // 2})
-                continue
-
-            xs_sorted = np.sort(xs)
-            diffs = np.diff(xs_sorted)
-            left_x = right_x = None
-            # split_gap 넘는 틈으로 라인 클러스터(각 라인의 평균 x) 목록을 만든다
-            cuts = np.nonzero(diffs > split_gap)[0] if diffs.size > 0 else np.empty(0, int)
-            if cuts.size:
-                bounds = [0] + [int(c) + 1 for c in cuts] + [xs_sorted.size]
-                clusters = [float(xs_sorted[bounds[k]:bounds[k + 1]].mean())
-                            for k in range(len(bounds) - 1)]
-            else:
-                clusters = [float(xs_sorted.mean())]
-
-            if branch_hint != 0:
-                # hugging: 추종하던 바깥 라인 하나만. 안쪽(중앙)으로 확 튀는 클러스터
-                # (=가운데 V/섬)는 무시하고, 진짜 라인이 사라진 구간은 coast(직진 유지).
-                if running_line is None:
-                    # 시작 앵커: 힌트 쪽 최외곽 라인
-                    running_line = clusters[0] if branch_hint > 0 else clusters[-1]
-                else:
-                    nearest = min(clusters, key=lambda c: abs(c - running_line))
-                    # 좌 hugging이면 안쪽=오른쪽(+), 우 hugging이면 안쪽=왼쪽(-).
-                    # 안쪽으로 hug_track_tol 넘게 튀면 라인 소실로 보고 running_line 유지(coast).
-                    inner_jump = (
-                        (branch_hint > 0 and nearest > running_line + hug_track_tol) or
-                        (branch_hint < 0 and nearest < running_line - hug_track_tol))
-                    if not inner_jump:
-                        running_line = nearest      # 바깥/근처 → 진짜 라인, 따라감(벌어져도 OK)
-                    # inner_jump이면 running_line 그대로 두고 coast
-                if branch_hint > 0:
-                    left_x = running_line           # 왼쪽 라인만 표시(오른쪽 무시)
-                    center = running_line + hug_bias
-                else:
-                    right_x = running_line          # 오른쪽 라인만 표시(왼쪽 무시)
-                    center = running_line - hug_bias
-            elif len(clusters) >= 2:
-                # 평소, 라인 둘 이상: 직전 좌/우 앵커에 '가장 가까운' 클러스터로 배정한다.
-                # 앵커가 아직 없으면(cold start) 가장 큰 틈으로 좌/우를 나눈다.
-                if running_left is not None and running_right is not None:
-                    left_x = min(clusters, key=lambda c: abs(c - running_left))
-                    right_x = min(clusters, key=lambda c: abs(c - running_right))
-                    if left_x >= right_x:   # 같은/역전 클러스터가 잡히면 틈 분리로 폴백
-                        split = int(np.argmax(diffs))
-                        left_x = float(xs_sorted[:split + 1].mean())
-                        right_x = float(xs_sorted[split + 1:].mean())
-                else:
-                    split = int(np.argmax(diffs))
-                    left_x = float(xs_sorted[:split + 1].mean())
-                    right_x = float(xs_sorted[split + 1:].mean())
-                center = (left_x + right_x) / 2.0
-            else:
-                # 평소, 한쪽 라인만: 직전 좌/우 라인 중 '더 가까운' 쪽으로 판정하고
-                # 반대편은 lane 폭으로 추정. (중심 대비 판정이 아니라 라인 연속성 기반)
-                boundary = clusters[0]
-                dl = abs(boundary - running_left) if running_left is not None else float('inf')
-                dr = abs(boundary - running_right) if running_right is not None else float('inf')
-                if dl == float('inf') and dr == float('inf'):
-                    # 앵커 없음(초기/장기 소실) → 최선으로 화면 중심 기준 판정
-                    if boundary < running_center:
-                        dl = 0.0
-                    else:
-                        dr = 0.0
-                if dl <= dr:
-                    left_x = boundary
-                    center = boundary + half_width
-                else:
-                    right_x = boundary
-                    center = boundary - half_width
-
-            center = float(np.clip(center, 0.0, width))
-            running_center = center
-            # 본 라인만 앵커 갱신, 안 보인 쪽은 직전값 유지(안정적 앵커)
-            if left_x is not None:
-                running_left = left_x
-            if right_x is not None:
-                running_right = right_x
-            bands.append({
-                'valid': True, 'y': (y0 + y1) // 2,
-                'left': left_x, 'right': right_x, 'center': center,
-            })
-
-        # running_line = 마지막으로 알던 추종 라인 위치(사라짐 구간에도 유지) → 다음 프레임 시드
-        return bands, running_line
+        return lane_core.analyze_bands(
+            mask, width, num_bands, min_pixels, split_gap,
+            half_width, seed_center, seed_left, seed_right,
+            branch_hint, hug_bias, hug_line_seed, hug_track_tol,
+            int(self.get_parameter('cluster_max_width_px').value),
+            int(self.get_parameter('cluster_min_pixels').value),
+            float(self.get_parameter('anchor_gate_ratio').value))
 
     # ------------------------------------------------------------------ #
     #  프레임 간 좌/우 앵커 확정 (플립 히스테리시스)

@@ -74,6 +74,10 @@ lane_node:
     num_bands: 10
     line_split_gap_px: 40
     lane_half_width_px: 90
+    # --- 클러스터 검증(mod 1): 십자 가로획/잡음 조각을 배정 전에 걸러냄 ---
+    cluster_max_width_px: 60    # BEV 차선폭 ~2.5배. 넘으면 가로획으로 보고 버림 (십자 무늬 차단)
+    cluster_min_pixels: 30      # 실제 흰 픽셀 수 하한 (잡음 조각 배제)
+    anchor_gate_ratio: 0.4      # |cx−앵커| > half_width·이 값 이면 배정 안 함 (오배정 차단)
     flip_confirm_frames: 3      # 좌/우 반전을 확정하는 연속 프레임 수 (↑=더 끈질기게 유지)
     hug_bias_px: 90             # 갈림길 hugging 시 라인에서 떨어지는 정도(BEV px)
     # --- BEV 사다리꼴 (트랙 실측 튜닝값) ---
