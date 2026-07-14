@@ -72,6 +72,11 @@ class LaneNode(Node):
         self.declare_parameter('cluster_min_pixels', 30)        # 실제 흰 픽셀 수 하한(잡음 조각 배제)
         # 앵커 게이트: 최근접이라도 |cx−앵커| > half_width·gate_ratio면 배정 안 함(오배정 차단)
         self.declare_parameter('anchor_gate_ratio', 0.4)
+        # 앵커 갱신 EMA(mod 2): 밴드 간은 크게(커브 추종), 프레임 간은 작게(안정).
+        self.declare_parameter('anchor_alpha_band', 0.6)        # 밴드 간 EMA 계수
+        self.declare_parameter('anchor_max_step_band_px', 25)   # 밴드 간 이동량 상한(px)
+        self.declare_parameter('anchor_alpha_frame', 0.35)      # 프레임 간 EMA 계수
+        self.declare_parameter('anchor_max_step_frame_px', 15)  # 프레임 간 이동량 상한(px)
         # 갈림길 hugging bias: 추종할 라인에서 이만큼만 안쪽으로 붙는다(작을수록 라인에 밀착)
         self.declare_parameter('hug_bias_px', 45)
         # hugging 중 추종 라인이 '안쪽(중앙)'으로 이 픽셀보다 확 튀면 = 라인 사라지고
@@ -236,7 +241,9 @@ class LaneNode(Node):
             branch_hint, hug_bias, hug_line_seed, hug_track_tol,
             int(self.get_parameter('cluster_max_width_px').value),
             int(self.get_parameter('cluster_min_pixels').value),
-            float(self.get_parameter('anchor_gate_ratio').value))
+            float(self.get_parameter('anchor_gate_ratio').value),
+            float(self.get_parameter('anchor_alpha_band').value),
+            float(self.get_parameter('anchor_max_step_band_px').value))
 
     # ------------------------------------------------------------------ #
     #  프레임 간 좌/우 앵커 확정 (플립 히스테리시스)
@@ -248,10 +255,23 @@ class LaneNode(Node):
         앵커를 침범(좌 라인인데 우 앵커보다 오른쪽 등)하면 오배정으로 의심해,
         flip_confirm 프레임 연속으로 그럴 때만 앵커를 뒤집는다. 그 전까지는 이전
         앵커를 유지해 순간 오검출로 좌/우가 뒤집히는 것을 막는다.
+
+        (mod 2) 확정 시 raw 대입이 아니라 프레임 간 EMA+이동량 상한(ema_step)으로
+        갱신한다. flip 히스테리시스는 유지하되 통과한 값을 EMA로 흡수한다.
         """
+        alpha = float(self.get_parameter('anchor_alpha_frame').value)
+        max_step = float(self.get_parameter('anchor_max_step_frame_px').value)
+
+        def commit_left(x):
+            self.prev_left = lane_core.ema_step(self.prev_left, x, alpha, max_step)
+
+        def commit_right(x):
+            self.prev_right = lane_core.ema_step(self.prev_right, x, alpha, max_step)
+
         nl, nr = band['left'], band['right']
         if nl is not None and nr is not None:
-            self.prev_left, self.prev_right = nl, nr
+            commit_left(nl)
+            commit_right(nr)
             self.flip_count = 0
             return
 
@@ -261,20 +281,20 @@ class LaneNode(Node):
             if crossed:
                 self.flip_count += 1
                 if self.flip_count >= flip_confirm:
-                    self.prev_left = nl
+                    commit_left(nl)
                     self.flip_count = 0
             else:
-                self.prev_left = nl
+                commit_left(nl)
                 self.flip_count = 0
         elif nr is not None:          # 오른쪽 라인만 봄
             crossed = (self.prev_left is not None and nr < self.prev_left + min_gap)
             if crossed:
                 self.flip_count += 1
                 if self.flip_count >= flip_confirm:
-                    self.prev_right = nr
+                    commit_right(nr)
                     self.flip_count = 0
             else:
-                self.prev_right = nr
+                commit_right(nr)
                 self.flip_count = 0
 
     # ------------------------------------------------------------------ #

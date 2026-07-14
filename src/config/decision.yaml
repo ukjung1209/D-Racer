@@ -78,6 +78,11 @@ lane_node:
     cluster_max_width_px: 60    # BEV 차선폭 ~2.5배. 넘으면 가로획으로 보고 버림 (십자 무늬 차단)
     cluster_min_pixels: 30      # 실제 흰 픽셀 수 하한 (잡음 조각 배제)
     anchor_gate_ratio: 0.4      # |cx−앵커| > half_width·이 값 이면 배정 안 함 (오배정 차단)
+    # --- 앵커 갱신 EMA(mod 2): 밴드 간은 크게(커브 추종) / 프레임 간은 작게(안정) ---
+    anchor_alpha_band: 0.6      # 밴드 간 EMA 계수 (↑=커브 더 빨리 따라감)
+    anchor_max_step_band_px: 25 # 밴드 간 이동량 상한(px) — 한 스텝에 이보다 못 튐
+    anchor_alpha_frame: 0.35    # 프레임 간 EMA 계수 (↓=프레임 튐에 더 둔감)
+    anchor_max_step_frame_px: 15 # 프레임 간 이동량 상한(px)
     flip_confirm_frames: 3      # 좌/우 반전을 확정하는 연속 프레임 수 (↑=더 끈질기게 유지)
     hug_bias_px: 90             # 갈림길 hugging 시 라인에서 떨어지는 정도(BEV px)
     # --- BEV 사다리꼴 (트랙 실측 튜닝값) ---

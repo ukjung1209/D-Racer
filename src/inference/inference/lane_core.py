@@ -12,6 +12,22 @@ import numpy as np
 
 
 # ------------------------------------------------------------------ #
+#  앵커 갱신: EMA + 이동량 상한
+# ------------------------------------------------------------------ #
+def ema_step(anchor, meas, alpha, max_step):
+    """앵커를 meas 쪽으로 EMA 갱신하되 한 스텝 이동량을 max_step으로 제한.
+
+    커브에서 라인이 빠르게 움직여도 앵커가 한 번에 튀지 않게 하고(오검출 1회로 앵커가
+    날아가는 것 방지), 그러면서도 alpha만큼은 실제 관측을 따라가게 한다.
+    anchor가 None(첫 관측)이면 meas를 그대로 채택한다.
+    """
+    if anchor is None:
+        return float(meas)
+    step = float(np.clip(meas - anchor, -max_step, max_step))
+    return float(anchor + alpha * step)
+
+
+# ------------------------------------------------------------------ #
 #  가로 밴드 → 라인 클러스터 추출
 # ------------------------------------------------------------------ #
 def extract_clusters(band, split_gap):
@@ -53,7 +69,8 @@ def valid_clusters(clusters, max_width_px, min_pixels):
 def analyze_bands(mask, width, num_bands, min_pixels, split_gap,
                   half_width, seed_center, seed_left, seed_right,
                   branch_hint, hug_bias, hug_line_seed, hug_track_tol,
-                  cluster_max_width_px, cluster_min_pixels, anchor_gate_ratio):
+                  cluster_max_width_px, cluster_min_pixels, anchor_gate_ratio,
+                  anchor_alpha_band=1.0, anchor_max_step_band_px=1e9):
     """밴드마다 좌/우 라인을 나눠 차선 중심을 잡는다. (mask/width는 분석영상 좌표계)
 
     per-line 앵커(seed_left/seed_right)는 직전 프레임의 좌/우 라인 x다. 한쪽 라인만
@@ -65,7 +82,10 @@ def analyze_bands(mask, width, num_bands, min_pixels, split_gap,
       · 앵커 게이트: 최근접이라도 |cx − anchor| > half_width·gate_ratio면 배정 안 함.
       · 좌/우가 같은 클러스터거나 left ≥ right 역전이면 '최대 틈 분리 폴백'(오염 통로)
         대신 그 밴드를 무효 처리한다. "잘못 배정하느니 밴드를 버린다."
-    hugging(branch_hint != 0) 경로는 필터/게이트 대상에서 제외 — 동작 그대로 보존.
+    강건화(mod 2):
+      · 밴드 간 앵커 전파를 raw 대입이 아니라 EMA+이동량 상한(ema_step)으로 한다.
+        오검출 1회로 앵커가 튀지 않으면서 커브는 alpha만큼 따라간다.
+    hugging(branch_hint != 0) 경로는 필터/게이트/EMA 대상에서 제외 — 동작 그대로 보존.
     """
     h = mask.shape[0]
     band_h = max(1, h // num_bands)
@@ -173,11 +193,15 @@ def analyze_bands(mask, width, num_bands, min_pixels, split_gap,
 
         center = float(np.clip(center, 0.0, width))
         running_center = center
-        # 본 라인만 앵커 갱신, 안 보인 쪽은 직전값 유지(안정적 앵커)
-        if left_x is not None:
-            running_left = left_x
-        if right_x is not None:
-            running_right = right_x
+        # 본 라인만 앵커 갱신(EMA+이동량 상한), 안 보인 쪽은 직전값 유지(안정적 앵커).
+        # hugging 경로는 running_left/right가 이후 밴드에 쓰이지 않으므로 갱신 생략.
+        if branch_hint == 0:
+            if left_x is not None:
+                running_left = ema_step(
+                    running_left, left_x, anchor_alpha_band, anchor_max_step_band_px)
+            if right_x is not None:
+                running_right = ema_step(
+                    running_right, right_x, anchor_alpha_band, anchor_max_step_band_px)
         bands.append({
             'valid': True, 'y': y_mid,
             'left': left_x, 'right': right_x, 'center': center, 'weight': weight,
