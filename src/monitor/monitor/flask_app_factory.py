@@ -1,10 +1,11 @@
 from pathlib import Path
+import socket
 import threading
 import time
 
 try:
     from flask import Flask, Response, jsonify, render_template, send_file
-    from werkzeug.serving import make_server
+    from werkzeug.serving import make_server, WSGIRequestHandler
     FLASK_IMPORT_ERROR = None
 except (ModuleNotFoundError, ImportError) as exc:
     Flask = None
@@ -13,7 +14,24 @@ except (ModuleNotFoundError, ImportError) as exc:
     render_template = None
     send_file = None
     make_server = None
+    WSGIRequestHandler = object
     FLASK_IMPORT_ERROR = exc
+
+
+class LowLatencyRequestHandler(WSGIRequestHandler):
+    """Keep each MJPEG connection's kernel send buffer tiny so latency can't
+    accumulate: once the buffer fills, the stream generator blocks on yield and
+    then emits the *newest* frame, dropping stale ones instead of queuing a
+    growing backlog. TCP_NODELAY avoids Nagle batching so frames go out at once.
+    """
+
+    def setup(self):
+        super().setup()
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16 * 1024)
+        except OSError:
+            pass
 
 from .image_utils import build_camera_placeholder_svg
 
@@ -25,7 +43,10 @@ STATIC_DIR = PACKAGE_ROOT / 'static'
 class FlaskServerThread(threading.Thread):
     def __init__(self, app, host, port):
         super().__init__(daemon=True)
-        self._server = make_server(host, port, app, threaded=True)
+        self._server = make_server(
+            host, port, app, threaded=True,
+            request_handler=LowLatencyRequestHandler,
+        )
 
     def run(self):
         self._server.serve_forever()

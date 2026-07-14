@@ -22,20 +22,17 @@ def clamp(value, low, high):
 
 
 class DecisionLightNode(Node):
-    """차선(/lane/state)과 신호등(/object/detections green/red)으로 주행 명령(/control)을 낸다.
+    """차선(/lane/state)추종 + 신호등(/object/detections) 출발/정지 주행.
 
-    ── 팀 병렬개발용 파생 노드 ──
-    차선추종 PD 코어는 decision_node와 100% 동일하게 유지하고, 갈림길 대신
-    '신호등 출발+정지' 상태머신만 얹었다. 나중에 decision_node로 merge할 때는
-    이 상태머신을 그대로 옮기고 control_loop의 throttle 우선순위만 합치면 된다.
+    ── 신호등 미션 로직 (아주 단순) ──
+    조향은 항상 /lane/state PD 차선추종, throttle만 신호등 상태로 켜고 끈다.
+      STOPPED : 정지. 초록불(green)을 green_votes_needed프레임 연속 보면 출발(→GO).
+      GO      : 차선추종 주행. 빨간불(red)을 red_votes_needed프레임 연속 보면 정지(→STOPPED).
+    → 처음엔 STOPPED로 시작(가만히 있다가 초록불 3프레임 보면 출발).
+    → STOPPED에서 다시 초록불 3프레임 보면 재출발한다.
 
-    신호등 상태머신 (조향은 항상 차선추종, throttle만 상태로 제어):
-      HOLD  : 초기 정지. green을 votes만큼 연속 검출하면 출발(→GO).
-              start_require_green=False면 처음부터 GO로 시작(신호 없이 주행 테스트).
-      GO    : 차선추종 주행. red가 충분히 크게(=정지선 코앞, area≥stop_area_trigger)
-              votes만큼 보이면 정지(→STOP).
-      STOP  : 정지선 정지(throttle 0). green을 votes만큼 다시 보면 재출발(→GO).
-    갈림길/동적장애물 미션은 이 노드 범위 밖(다른 파생 노드/merge에서 담당).
+    초록/빨강은 object_node의 YOLO(best_320.onnx)가 내는 /object/detections의
+    class_name('green'/'red')으로 판단한다. 크기(area) 조건 없이 '연속 프레임 수'만 본다.
     """
 
     def __init__(self):
@@ -49,21 +46,18 @@ class DecisionLightNode(Node):
 
         # --- 차선추종 PD 제어 파라미터 (decision_node와 동일) ---
         self.declare_parameter('steer_kp', 0.8)
-        self.declare_parameter('steer_kd', 0.3)
+        self.declare_parameter('steer_kd', 0.4)
         self.declare_parameter('steer_ka', 0.0)
         self.declare_parameter('steering_sign', -1.0)
         self.declare_parameter('steer_trim', float('nan'))
-        self.declare_parameter('base_throttle', 0.15)
+        self.declare_parameter('base_throttle', 0.20)
         self.declare_parameter('lane_timeout_sec', 0.5)
 
-        # --- 신호등 미션 파라미터 (live 튜닝 가능) ---
+        # --- 신호등 미션 파라미터 (실시간 튜닝 가능) ---
         self.declare_parameter('enable_light_mission', True)
-        self.declare_parameter('start_require_green', True)  # 출발 시 green 신호 대기
-        self.declare_parameter('light_conf_min', 0.5)        # 신호등 최소 confidence
-        self.declare_parameter('green_votes_needed', 3)      # 출발/재출발 확정 표수
-        self.declare_parameter('red_votes_needed', 3)        # 정지 확정 표수
-        self.declare_parameter('stop_area_trigger', 0.04)    # red 이보다 크면 정지선 코앞
-        self.declare_parameter('go_throttle', float('nan'))  # NaN이면 base_throttle 사용
+        self.declare_parameter('light_conf_min', 0.5)     # 신호등 최소 confidence
+        self.declare_parameter('green_votes_needed', 3)   # 초록불 이만큼 연속 보면 출발
+        self.declare_parameter('red_votes_needed', 3)     # 빨간불 이만큼 연속 보면 정지
 
         lane_topic = str(self.get_parameter('lane_topic').value)
         detection_topic = str(self.get_parameter('detection_topic').value)
@@ -76,13 +70,10 @@ class DecisionLightNode(Node):
 
         self.lane_state = None
         self.lane_stamp = None
-        self.detections = None
         self.prev_offset = 0.0
 
         # --- 신호등 상태머신 상태 ---
-        # start_require_green=False면 바로 GO로 시작
-        self.light_state = 'HOLD' if bool(
-            self.get_parameter('start_require_green').value) else 'GO'
+        self.light_state = 'STOPPED'   # STOPPED | GO
         self.vote_green = 0
         self.vote_red = 0
 
@@ -116,55 +107,41 @@ class DecisionLightNode(Node):
         self.lane_stamp = self.get_clock().now()
 
     def detection_callback(self, msg: DetectionArray):
-        self.detections = msg
         if not bool(self.get_parameter('enable_light_mission').value):
             return
         self._update_light(msg)
 
     # ------------------------------------------------------------------ #
-    #  신호등: green/red 검출로 출발/정지 상태 전이
+    #  신호등: green/red 연속 프레임 수로 출발/정지 전이
     # ------------------------------------------------------------------ #
-    def _pick_light(self, msg: DetectionArray, class_name):
-        """해당 색의 신호등 중 confidence를 통과한 가장 큰(가까운) 것을 고른다."""
+    def _has_light(self, msg: DetectionArray, class_name):
+        """해당 색 신호등이 confidence 넘겨 검출됐는지."""
         conf_min = float(self.get_parameter('light_conf_min').value)
-        best = None
         for det in msg.detections:
-            if det.class_name != class_name:
-                continue
-            if det.confidence < conf_min:
-                continue
-            if best is None or det.area_ratio > best.area_ratio:
-                best = det
-        return best
+            if det.class_name == class_name and det.confidence >= conf_min:
+                return True
+        return False
 
     def _update_light(self, msg: DetectionArray):
-        green = self._pick_light(msg, 'green')
-        red = self._pick_light(msg, 'red')
+        green = self._has_light(msg, 'green')
+        red = self._has_light(msg, 'red')
 
-        if self.light_state in ('HOLD', 'STOP'):
-            # green을 연속으로 보면 출발/재출발
-            if green is not None:
-                self.vote_green += 1
-            else:
-                self.vote_green = 0
+        if self.light_state == 'STOPPED':
+            # 초록불을 연속으로 보면 출발
+            self.vote_green = self.vote_green + 1 if green else 0
             self.vote_red = 0
             if self.vote_green >= int(self.get_parameter('green_votes_needed').value):
-                self.get_logger().info(
-                    f'light: {self.light_state} → GO (green)')
+                self.get_logger().info('light: STOPPED → GO (green)')
                 self.light_state = 'GO'
                 self.vote_green = 0
 
         elif self.light_state == 'GO':
-            # red가 충분히 크게(정지선 코앞) 연속으로 보이면 정지
-            trigger = float(self.get_parameter('stop_area_trigger').value)
-            if red is not None and red.area_ratio >= trigger:
-                self.vote_red += 1
-            else:
-                self.vote_red = 0
+            # 빨간불을 연속으로 보면 정지
+            self.vote_red = self.vote_red + 1 if red else 0
             self.vote_green = 0
             if self.vote_red >= int(self.get_parameter('red_votes_needed').value):
-                self.get_logger().info('light: GO → STOP (red)')
-                self.light_state = 'STOP'
+                self.get_logger().info('light: GO → STOPPED (red)')
+                self.light_state = 'STOPPED'
                 self.vote_red = 0
 
     def _lane_is_fresh(self):
@@ -202,11 +179,8 @@ class DecisionLightNode(Node):
 
         if pd_steer is not None:
             control.steering = float(clamp(pd_steer, -1.0, 1.0))
-            # HOLD/STOP이면 조향은 유지하되 정지, GO면 주행
-            go_throttle = float(self.get_parameter('go_throttle').value)
-            if math.isnan(go_throttle):
-                go_throttle = float(self.get_parameter('base_throttle').value)
-            control.throttle = go_throttle if going else 0.0
+            # GO면 주행, STOPPED면 조향은 유지하되 정지
+            control.throttle = float(self.get_parameter('base_throttle').value) if going else 0.0
         else:
             # 차선을 잃으면 안전 정지
             self.prev_offset = 0.0

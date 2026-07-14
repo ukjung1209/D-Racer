@@ -69,22 +69,23 @@ def generate_launch_description():
             parameters=[
                 {
                     'vehicle_config_file': vehicle_config_path,
-                    # --- 회색 트랙 흰색 라인: 밝기 임계값으로 검출 ---
-                    # 흰 선은 색(HSV)이 아니라 밝기로 잡는다. 회색 매트보다
-                    # 흰 선이 밝으므로 binary_threshold 위쪽만 남긴다.
-                    # 조명 따라 트랙에서 실측 튜닝: ros2 param set /lane_node binary_threshold <값>
+                    # --- 흰색 차선 모드 (white_s_max/white_v_min으로 튜닝) ---
                     'lane_color': 'white',
-                    'binary_threshold': 180,
+                    'white_s_max': 20,     # 채도 상한↓ = 회색/색깔 배제 (안 잡히면 ↑, 잡티 많으면 ↓). 40→20: 푸르스름한 트랙 무늬(반사) 배제
+                    'white_v_min': 120,    # 명도 하한↑ = 완전 흰색만 (노출40에서 흰선 밝기 실측 ~130 → 120)
+                    # 빛반사(넓은 밝은 덩어리) 제거: 커널보다 작은 밝은 구조(얇은 차선)만 남김
+                    'white_tophat_ksize': 21,  # 글레어 남으면 ↓, 차선 끊기면 ↑ (0=끔)
+                    'white_tophat_min': 18,    # top-hat 대비 하한 (글레어 남으면 ↑, 차선 끊기면 ↓)
                     'roi_top_px': 45,
                     'num_bands': 10,
                     'line_split_gap_px': 40,
                     'lane_half_width_px': 90,
                     # --- BEV 사다리꼴 (실트랙 튜닝값) ---
-                    'bev_top_left': 0.25,
-                    'bev_top_right': 0.75,
+                    'bev_top_left': 0.1,
+                    'bev_top_right': 0.9,
                     'bev_top_y': 0.32,
-                    'bev_bottom_left': 0.05,
-                    'bev_bottom_right': 0.95,
+                    'bev_bottom_left': 0.0,
+                    'bev_bottom_right': 1.0,
                     'publish_debug': True,
                 },
             ],
@@ -101,10 +102,15 @@ def generate_launch_description():
                 {
                     'vehicle_config_file': vehicle_config_path,
                     'steer_kp': 0.8,
-                    'steer_kd': 0.4,
+                    'steer_kd': 0.45,
                     'steer_ka': 0.0,
                     'steering_sign': -1.0,
-                    'base_throttle': 0.15,
+                    'base_throttle': 0.31,
+                    # 가변속도: 직선 빠르게 / 코너 미리 감속 (angle 예측 + offset 보정)
+                    'speed_ka': 0.4,
+                    'speed_ko': 0.4,
+                    'min_throttle': 0.10,
+                    'throttle_accel_rate': 0.5,
                     'enable_fork_mission': False,  # object_node 없음 → 순수 차선추종
                 },
             ],

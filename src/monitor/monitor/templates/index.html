@@ -35,6 +35,7 @@
             <span class="status-chip" id="image-chip">WAITING</span>
           </div>
 
+          {% if image_topic %}
           <div class="image-stage">
             <img
               id="camera-frame"
@@ -43,6 +44,7 @@
               alt="Camera stream preview"
             >
           </div>
+          {% endif %}
 
           <dl class="status-meta">
             <div class="status-meta__row">
@@ -61,21 +63,27 @@
 
           {% if debug_image %}
           <div class="debug-grid" id="debug-grid">
+            {% if opencv_grayscale_topic %}
             <article class="debug-panel">
               <p class="debug-panel__title">Grayscale</p>
               <img id="debug-frame-grayscale" class="debug-panel__frame" src="{{ placeholder_url }}" alt="Grayscale preview">
               <p class="debug-panel__topic">{{ opencv_grayscale_topic }}</p>
             </article>
+            {% endif %}
+            {% if opencv_blur_topic %}
             <article class="debug-panel">
               <p class="debug-panel__title">Blur</p>
               <img id="debug-frame-blur" class="debug-panel__frame" src="{{ placeholder_url }}" alt="Blur preview">
               <p class="debug-panel__topic">{{ opencv_blur_topic }}</p>
             </article>
+            {% endif %}
+            {% if opencv_edge_topic %}
             <article class="debug-panel">
               <p class="debug-panel__title">Edge</p>
               <img id="debug-frame-edge" class="debug-panel__frame" src="{{ placeholder_url }}" alt="Edge preview">
               <p class="debug-panel__topic">{{ opencv_edge_topic }}</p>
             </article>
+            {% endif %}
           </div>
           {% endif %}
         </article>

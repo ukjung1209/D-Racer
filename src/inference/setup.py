@@ -25,6 +25,7 @@ setup(
         'console_scripts': [
             'lane_node = inference.lane_node:main',
             'object_node = inference.object_node:main',
+            'decision_node = inference.decision_node:main',
             'decision_arrow_node = inference.decision_arrow_node:main',
             'decision_light_node = inference.decision_light_node:main',
             'decision_obstacle_node = inference.decision_obstacle_node:main',

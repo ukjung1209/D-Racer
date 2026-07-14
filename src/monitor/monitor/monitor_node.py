@@ -66,7 +66,7 @@ class MonitorNode(Node):
         self.declare_parameter('joystick_topic', 'joystick')
         self.declare_parameter('storage_path', '/')
         self.declare_parameter('storage_poll_interval_sec', 1.0)
-        self.declare_parameter('web_host', '192.168.0.12')
+        self.declare_parameter('web_host', '0.0.0.0')   # 모든 인터페이스 바인딩(원격 접속 가능)
         self.declare_parameter('web_port', 5000)
         self.declare_parameter('page_title', 'D-Racer Monitor')
         self.declare_parameter('refresh_interval_ms', 1000)
@@ -84,7 +84,18 @@ class MonitorNode(Node):
         yaml_config = self.load_vehicle_config()
 
         self.battery_topic = self.get_yaml_or_param_str(yaml_config, 'BATTERY_TOPIC', 'battery_topic')
-        self.image_topic = self.get_yaml_or_param_str(yaml_config, 'IMAGE_TOPIC', 'image_topic')
+        # 런치에서 image_topic 을 명시하면 vehicle_config의 IMAGE_TOPIC보다 우선한다.
+        #   '' → 카메라 패널을 끈다(부하↓)
+        #   기본값(/camera/image/compressed) 외의 토픽 → 그 토픽을 Image Status 패널에 띄움
+        #     (예: race.launch에서 /lane/debug/bev 를 줘 '차선 인지'를 보여줌)
+        #   안 주면(기본값) → 기존대로 yaml/param 값 사용(하위호환)
+        image_topic_param = str(self.get_parameter('image_topic').value).strip()
+        if image_topic_param == '':
+            self.image_topic = ''
+        elif image_topic_param != '/camera/image/compressed':
+            self.image_topic = image_topic_param
+        else:
+            self.image_topic = self.get_yaml_or_param_str(yaml_config, 'IMAGE_TOPIC', 'image_topic')
         self.control_topic = self.get_yaml_or_param_str(yaml_config, 'CONTROL_TOPIC', 'control_topic')
         self.debug_image = self.get_yaml_or_param_bool_multi(yaml_config, ('OPENCV_DEBUG_MODE', 'DEBUG_IMAGE'), 'debug_image')
         self.opencv_grayscale_topic = self.get_yaml_or_param_str(yaml_config, 'OPENCV_GRAYSCALE_TOPIC', 'opencv_grayscale_topic')
@@ -175,31 +186,37 @@ class MonitorNode(Node):
             self.battery_callback,
             10,
         )
-        self.create_subscription(
-            CompressedImage,
-            self.image_topic,
-            self.image_callback,
-            image_qos,
-        )
+        # 토픽 문자열이 비면 그 패널을 아예 안 띄운다(구독 스킵 → CPU/네트워크 절약).
+        # 런치에서 image_topic:'' 또는 opencv_*_topic:'' 로 패널을 골라 끌 수 있다.
+        if self.image_topic:
+            self.create_subscription(
+                CompressedImage,
+                self.image_topic,
+                self.image_callback,
+                image_qos,
+            )
         if self.debug_image:
-            self.create_subscription(
-                CompressedImage,
-                self.opencv_grayscale_topic,
-                self.debug_grayscale_callback,
-                image_qos,
-            )
-            self.create_subscription(
-                CompressedImage,
-                self.opencv_blur_topic,
-                self.debug_blur_callback,
-                image_qos,
-            )
-            self.create_subscription(
-                CompressedImage,
-                self.opencv_edge_topic,
-                self.debug_edge_callback,
-                image_qos,
-            )
+            if self.opencv_grayscale_topic:
+                self.create_subscription(
+                    CompressedImage,
+                    self.opencv_grayscale_topic,
+                    self.debug_grayscale_callback,
+                    image_qos,
+                )
+            if self.opencv_blur_topic:
+                self.create_subscription(
+                    CompressedImage,
+                    self.opencv_blur_topic,
+                    self.debug_blur_callback,
+                    image_qos,
+                )
+            if self.opencv_edge_topic:
+                self.create_subscription(
+                    CompressedImage,
+                    self.opencv_edge_topic,
+                    self.debug_edge_callback,
+                    image_qos,
+                )
         self.create_subscription(
             Control,
             self.control_topic,
@@ -220,7 +237,9 @@ class MonitorNode(Node):
 
         self.server_thread.start()
 
-        display_host = '127.0.0.1' if self.web_host == '0.0.0.0' else self.web_host
+        # 0.0.0.0(모든 인터페이스) 바인딩이면 로그엔 실제 LAN IP를 찍어야 다른 PC에서
+        # 바로 접속할 수 있다(127.0.0.1은 보드 자기 자신만 가리켜 원격에선 안 열림).
+        display_host = self._detect_lan_ip() if self.web_host == '0.0.0.0' else self.web_host
         self.get_logger().info(
             f'[Monitor node started] \n'
             f'battery_topic={self.battery_topic} \n'
@@ -229,9 +248,26 @@ class MonitorNode(Node):
             f'control_topic={self.control_topic}, \n'
             f'joystick_topic={self.joystick_topic}, \n'
             f'storage_path={self.storage_path}, \n'
-            f'web=http://{display_host}:{self.web_port} \n' 
+            f'web=http://{display_host}:{self.web_port} \n'
+            f'web(local)=http://127.0.0.1:{self.web_port} \n'  # VSCode 포트 알림 감지용(로컬 주소)
             f'vehicle_config_file={self.vehicle_config_file} \n'
         )
+
+    def _detect_lan_ip(self):
+        """이 보드의 실제 LAN IP를 찾는다(하드코딩 없이, DHCP로 바뀌어도 따라감).
+
+        외부로 UDP 소켓을 '연결'만 해(실제 패킷은 안 나감) 아웃바운드 인터페이스의
+        로컬 IP를 읽는 표준 방법. 실패하면 127.0.0.1로 폴백.
+        """
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(('8.8.8.8', 80))
+            return sock.getsockname()[0]
+        except Exception:
+            return '127.0.0.1'
+        finally:
+            sock.close()
 
     def get_graph_snapshot(self):
         return build_graph_snapshot(self)

@@ -31,6 +31,11 @@ class CameraNode(Node):
         self.declare_parameter('flip_method', 'rotate-180')
         self.declare_parameter('jpeg_quality', 90)
         self.declare_parameter('debug_log', True)
+        # USB 카메라(C920) v4l2 컨트롤을 파이프라인에 고정 (노출 반사광 억제).
+        # 빈 문자열이면 미적용(카메라 자동노출). 항목/값은 v4l2-ctl --list-ctrls 참고.
+        self.declare_parameter(
+            'usb_extra_controls',
+            'c,exposure_auto=1,exposure_absolute=40,exposure_auto_priority=0,gain=0')
 
         self.vehicle_config_file = os.path.expanduser(
             str(self.get_parameter('vehicle_config_file').value)
@@ -49,6 +54,7 @@ class CameraNode(Node):
         self.debug_log = bool(self.get_parameter('debug_log').value)
         self.publish_hz = publish_hz
         self.jpeg_quality = jpeg_quality
+        self.usb_extra_controls = str(self.get_parameter('usb_extra_controls').value).strip()
 
         self.image_width, self.image_height = self.load_image_size()
         self.usb_cam_enabled, self.mipi_cam_enabled = self.load_camera_source_flags()
@@ -142,9 +148,12 @@ class CameraNode(Node):
 
     def build_candidate_pipelines(self, camera_device, flip_method):
         if self.usb_cam_enabled:
+            # v4l2 컨트롤(노출 등)을 소스에 고정 → 재시작해도 자동 적용
+            extra = (f'extra-controls="{self.usb_extra_controls}" '
+                     if self.usb_extra_controls else '')
             # Many USB webcams expose MJPG by default.
             mjpg_pipeline = (
-                f"v4l2src device={camera_device} io-mode=2 ! "
+                f"v4l2src device={camera_device} {extra}io-mode=2 ! "
                 "image/jpeg,framerate=30/1 ! jpegdec ! "
                 "videoconvert ! videoscale ! "
                 f"video/x-raw,format=BGR,width={self.image_width},height={self.image_height},framerate=30/1 ! "
@@ -152,7 +161,7 @@ class CameraNode(Node):
             )
             # Fallback for raw USB camera modes.
             raw_pipeline = (
-                f"v4l2src device={camera_device} io-mode=2 ! "
+                f"v4l2src device={camera_device} {extra}io-mode=2 ! "
                 "videoconvert ! videoscale ! "
                 f"video/x-raw,format=BGR,width={self.image_width},height={self.image_height},framerate=30/1 ! "
                 "appsink sync=false drop=true max-buffers=1"
