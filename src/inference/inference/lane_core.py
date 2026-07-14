@@ -208,3 +208,32 @@ def analyze_bands(mask, width, num_bands, min_pixels, split_gap,
         })
 
     return bands, running_line
+
+
+# ------------------------------------------------------------------ #
+#  유효 밴드 전체에 가중 1차 피팅 → offset / angle (mod 3)
+# ------------------------------------------------------------------ #
+def fit_lane_line(ys, xs, weights, width):
+    """(y, lane_center)들에 가중 1차 직선을 맞춰 offset/angle을 뽑는다.
+
+    2점(near/far) 차분보다 밴드 전체를 쓰므로 한 밴드 튐에 둔감하다. 부호·스케일은
+    기존 규약과 동일하게 맞춘다:
+      offset = (최하단 y의 x − width/2) / (width/2)
+      angle  = (최상단 x − 최하단 x) / (width/2)   # = 기존 (far.center − near.center)
+    가중치 합이 0이면(예: hugging) 균등 가중으로 대체한다.
+    """
+    ys = np.asarray(ys, dtype=np.float64)
+    xs = np.asarray(xs, dtype=np.float64)
+    w = np.asarray(weights, dtype=np.float64)
+    if w.sum() <= 0:
+        w = np.ones_like(ys)
+    coeffs = np.polyfit(ys, xs, 1, w=w)
+    slope, intercept = float(coeffs[0]), float(coeffs[1])
+    y_bottom = float(ys.max())
+    y_top = float(ys.min())
+    x_bottom = slope * y_bottom + intercept
+    x_top = slope * y_top + intercept
+    half = width / 2.0
+    offset = (x_bottom - half) / half
+    angle = (x_top - x_bottom) / half
+    return offset, angle

@@ -379,8 +379,22 @@ class LaneNode(Node):
             cx = width / 2.0
             near = valid[0]                 # 가장 아래(가까운) 밴드
             far = valid[-1]                 # 가장 위(먼) 밴드
-            offset = (near['center'] - cx) / (width / 2.0)
-            angle = (far['center'] - near['center']) / (width / 2.0)
+            if self.branch_hint != 0:
+                # hugging: 동작 불변 위해 기존 2점(near/far) 차분 그대로.
+                offset = (near['center'] - cx) / (width / 2.0)
+                angle = (far['center'] - near['center']) / (width / 2.0)
+            else:
+                # (mod 3) 평소엔 유효 밴드 전체에 가중 직선 피팅(픽셀수 가중).
+                # 실패하면 기존 2점 차분으로 폴백.
+                try:
+                    ys = [b['y'] for b in valid]
+                    xs = [b['center'] for b in valid]
+                    ws = [b.get('weight', 0) for b in valid]
+                    offset, angle = lane_core.fit_lane_line(ys, xs, ws, width)
+                except Exception as exc:
+                    self.get_logger().warning(f'lane fit failed, 2점 차분 폴백: {exc}')
+                    offset = (near['center'] - cx) / (width / 2.0)
+                    angle = (far['center'] - near['center']) / (width / 2.0)
             state.detected = True
             state.offset = float(np.clip(offset, -1.0, 1.0))
             state.angle = float(np.clip(angle, -1.0, 1.0))
