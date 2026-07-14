@@ -172,6 +172,7 @@ def analyze_bands(mask, width, num_bands, min_pixels, split_gap,
 
         left_x = right_x = None
         weight = 0
+        rejected = []          # (mod 6) 필터에 걸린 클러스터 cx (디버그 회색 X)
 
         if branch_hint != 0:
             # ── hugging: 원본(미필터) 클러스터로 기존 동작 그대로 보존 ──
@@ -194,8 +195,11 @@ def analyze_bands(mask, width, num_bands, min_pixels, split_gap,
         else:
             # ── 평소: 필터 통과 클러스터만, 앵커 게이트로 배정 ──
             clusters = valid_clusters(raw, cluster_max_width_px, cluster_min_pixels)
+            rejected = [c['cx'] for c in raw
+                        if c['width'] > cluster_max_width_px
+                        or c['pixels'] < cluster_min_pixels]
             if not clusters:
-                bands.append({'valid': False, 'y': y_mid})
+                bands.append({'valid': False, 'y': y_mid, 'rejected': rejected})
                 continue
 
             if running_left is not None and running_right is not None:
@@ -272,6 +276,7 @@ def analyze_bands(mask, width, num_bands, min_pixels, split_gap,
         bands.append({
             'valid': True, 'y': y_mid,
             'left': left_x, 'right': right_x, 'center': center, 'weight': weight,
+            'rejected': rejected,
         })
 
     return bands, running_line

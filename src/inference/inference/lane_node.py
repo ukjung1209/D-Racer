@@ -1,3 +1,31 @@
+"""차선 검출 노드 (회색 매트 + 흰색 사이드라인, OpenCV+numpy, 딥러닝 없음).
+
+파이프라인: ROI 크롭 → BEV 원근 → 흰색 마스크 → 가로 밴드별 좌/우 라인 분리 →
+차선 중심 → LaneState(offset/angle/confidence) 발행. 순수 밴드 분석은 lane_core.py에
+있고(rclpy 없이 pytest 가능), 이 노드는 ROS 파라미터만 읽어 넘긴다.
+
+── 강건화 요약 (오검출/플립 방지) ──
+  1) 클러스터 검증 : 폭(cluster_max_width_px)·픽셀수(cluster_min_pixels)로 십자 가로획·
+                     잡음 조각을 배정 전에 제거. 앵커 게이트(anchor_gate_ratio)로 앵커에서
+                     너무 먼 클러스터는 배정 안 함. 역전/모호하면 밴드 무효(잘못 배정 금지).
+  2) 앵커 EMA     : 밴드/프레임 간 앵커를 raw가 아니라 EMA+이동량 상한으로 갱신
+                     (anchor_alpha_band/frame, anchor_max_step_band/frame_px) → 튐 방지.
+  3) 직선 피팅    : offset/angle을 유효 밴드 전체 가중(픽셀수) 1차 피팅으로. 부호는 기존과 동일.
+  4) 재획득       : 앵커 상실 시 히스토그램 두 피크(hist_width_tol)로 재획득, 한쪽만 보이면
+                     last_known_center 양가설(reacquire_margin)로 판정. 화면중심 폴백 제거.
+  5) 백분위 마스크: white V 하한을 프레임 상위 백분위(white_v_percentile)로 적응 → 밝은 매트 배제.
+  6) 디버그       : BEV에 기각 클러스터(회색 X)/앵커 세로선(좌파랑·우빨강)/피팅선(노랑)/state 표시.
+  ※ hugging(branch_hint±1) 경로는 1·2·3의 필터/게이트/EMA/피팅 대상에서 제외 — 동작 불변.
+
+── 튜닝 가이드(전부 decision.yaml lane_node) ──
+  · 십자/무늬 오검출 → cluster_max_width_px ↓ (BEV 실측 차선폭의 ~2배로)
+  · 잡음 오검출     → cluster_min_pixels ↑
+  · 좌/우 플립       → anchor_gate_ratio ↓(엄격) 또는 reacquire_margin ↑
+  · 커브 추종 느림   → anchor_alpha_band ↑ / anchor_max_step_band_px ↑
+  · 프레임 떨림      → anchor_alpha_frame ↓ / anchor_max_step_frame_px ↓
+  · 글레어/밝은 매트 → white_v_percentile ↑ (또는 white_tophat_min ↑)
+"""
+
 import math
 import os
 from pathlib import Path
@@ -485,16 +513,48 @@ class LaneNode(Node):
     # ------------------------------------------------------------------ #
     def _draw_bands(self, img, bands):
         w = img.shape[1]
-        cv2.line(img, (w // 2, 0), (w // 2, img.shape[0]), (120, 120, 120), 1)
+        h = img.shape[0]
+        cv2.line(img, (w // 2, 0), (w // 2, h), (120, 120, 120), 1)
+
+        # (mod 6) 프레임 좌/우 앵커 짧은 세로선 (좌=파랑, 우=빨강) — 배정 기준 표시
+        if self.prev_left is not None:
+            x = int(self.prev_left)
+            cv2.line(img, (x, 0), (x, 12), (255, 0, 0), 1)
+        if self.prev_right is not None:
+            x = int(self.prev_right)
+            cv2.line(img, (x, 0), (x, 12), (0, 0, 255), 1)
+
         for b in bands:
+            y = int(b['y'])
+            # (mod 6) 기각된 클러스터: 회색 X (십자 가로획/잡음 조각이 걸러졌음을 표시)
+            for rx in b.get('rejected', []):
+                rx = int(rx)
+                cv2.drawMarker(img, (rx, y), (150, 150, 150),
+                               cv2.MARKER_TILTED_CROSS, 8, 1)
             if not b['valid']:
                 continue
-            y = int(b['y'])
             if b['left'] is not None:
                 cv2.circle(img, (int(b['left']), y), 3, (255, 0, 0), -1)    # 파랑
             if b['right'] is not None:
                 cv2.circle(img, (int(b['right']), y), 3, (0, 0, 255), -1)   # 빨강
             cv2.circle(img, (int(b['center']), y), 3, (0, 255, 255), -1)    # 노랑
+
+        # (mod 6) 수정3 가중 피팅 직선을 노란 선으로 (유효 밴드 2개 이상)
+        valid = [b for b in bands if b['valid']]
+        if len(valid) >= 2:
+            try:
+                ys = np.array([b['y'] for b in valid], dtype=np.float64)
+                xs = np.array([b['center'] for b in valid], dtype=np.float64)
+                ws = np.array([b.get('weight', 0) for b in valid], dtype=np.float64)
+                if ws.sum() <= 0:
+                    ws = np.ones_like(ys)
+                slope, intercept = np.polyfit(ys, xs, 1, w=ws)
+                y_lo, y_hi = 0, h - 1
+                p_lo = (int(slope * y_lo + intercept), y_lo)
+                p_hi = (int(slope * y_hi + intercept), y_hi)
+                cv2.line(img, p_lo, p_hi, (0, 255, 255), 1)
+            except Exception:
+                pass
 
     def _encode_publish(self, image, publisher, source_msg, frame_id):
         ok, encoded = cv2.imencode(
@@ -514,7 +574,7 @@ class LaneNode(Node):
     def _publish_debug(self, roi, analysis_img, bev_src, bands, state, source_msg):
         text = (f"det={state.detected} off={state.offset:+.2f} "
                 f"ang={state.angle:+.2f} conf={state.confidence:.2f} "
-                f"hint={self.branch_hint:+d}")
+                f"hint={self.branch_hint:+d} state={self.track_state}")
 
         # raw 패널: 원본 ROI + 사다리꼴(초록) + 상태 텍스트
         raw = roi.copy()
