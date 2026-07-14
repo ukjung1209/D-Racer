@@ -64,13 +64,71 @@ def valid_clusters(clusters, max_width_px, min_pixels):
 
 
 # ------------------------------------------------------------------ #
+#  재획득 (mod 4): 앵커를 잃었을 때 좌/우를 다시 잡는다
+# ------------------------------------------------------------------ #
+def pick_side_hypothesis(x, half_width, width, last_known_center, margin):
+    """한쪽 라인 x가 좌/우 어느 쪽인지 last_known_center prior로 판정.
+
+    가설 L: 이 선이 왼쪽 → 차선중심 = x + half_width
+    가설 R: 이 선이 오른쪽 → 차선중심 = x − half_width
+    점수 = 0.4·(중심이 [0,width] 안:1/0) + 0.6·exp(−|중심 − prior| / half_width)
+    두 가설 점수 차가 margin 이상일 때만 'left'/'right' 확정, 아니면 None(판정 보류).
+    prior가 없으면(진짜 cold start) 판정 불가 → None.
+    """
+    if last_known_center is None:
+        return None
+    half = max(1.0, float(half_width))
+    cl = x + half_width   # 가설 L의 차선중심
+    cr = x - half_width   # 가설 R의 차선중심
+
+    def score(c):
+        in_bounds = 1.0 if 0.0 <= c <= width else 0.0
+        return 0.4 * in_bounds + 0.6 * float(np.exp(-abs(c - last_known_center) / half))
+
+    sl, sr = score(cl), score(cr)
+    if abs(sl - sr) < margin:
+        return None
+    return 'left' if sl > sr else 'right'
+
+
+def histogram_peaks(mask, half_width, width_tol):
+    """마스크 하단 1/3 열 히스토그램에서 두 라인 피크(좌, 우)를 추정한다.
+
+    최대 피크 + 그로부터 half_width 이상 떨어진 차순위 피크를 잡고, 두 피크 간격이
+    차선폭 가정 2·half_width·(1±width_tol) 안일 때만 (left, right)를 반환한다.
+    아니면 None(확정 보류) — 잘못된 앵커로 재출발하느니 한 프레임 더 기다린다.
+    """
+    h = mask.shape[0]
+    band = mask[(2 * h) // 3:, :]
+    hist = np.count_nonzero(band, axis=0).astype(np.float64)
+    if hist.max() <= 0:
+        return None
+    p1 = int(np.argmax(hist))
+    masked = hist.copy()
+    lo = max(0, p1 - int(half_width))
+    hi = min(len(masked), p1 + int(half_width) + 1)
+    masked[lo:hi] = 0.0                        # 첫 피크 주변을 지우고 둘째 피크 탐색
+    if masked.max() <= 0:
+        return None
+    p2 = int(np.argmax(masked))
+    left, right = sorted((p1, p2))
+    gap = right - left
+    lo_gap = 2.0 * half_width * (1.0 - width_tol)
+    hi_gap = 2.0 * half_width * (1.0 + width_tol)
+    if lo_gap <= gap <= hi_gap:
+        return float(left), float(right)
+    return None
+
+
+# ------------------------------------------------------------------ #
 #  가로 밴드별로 좌/우 라인 분리 → 차선 중심 추정 (아래→위 전파)
 # ------------------------------------------------------------------ #
 def analyze_bands(mask, width, num_bands, min_pixels, split_gap,
                   half_width, seed_center, seed_left, seed_right,
                   branch_hint, hug_bias, hug_line_seed, hug_track_tol,
                   cluster_max_width_px, cluster_min_pixels, anchor_gate_ratio,
-                  anchor_alpha_band=1.0, anchor_max_step_band_px=1e9):
+                  anchor_alpha_band=1.0, anchor_max_step_band_px=1e9,
+                  last_known_center=None, reacquire_margin=0.3):
     """밴드마다 좌/우 라인을 나눠 차선 중심을 잡는다. (mask/width는 분석영상 좌표계)
 
     per-line 앵커(seed_left/seed_right)는 직전 프레임의 좌/우 라인 x다. 한쪽 라인만
@@ -85,6 +143,10 @@ def analyze_bands(mask, width, num_bands, min_pixels, split_gap,
     강건화(mod 2):
       · 밴드 간 앵커 전파를 raw 대입이 아니라 EMA+이동량 상한(ema_step)으로 한다.
         오검출 1회로 앵커가 튀지 않으면서 커브는 alpha만큼 따라간다.
+    강건화(mod 4):
+      · 앵커 없이 한 줄만 보이는 밴드는 '화면 중심 기준' 폴백(플립 원인)을 버리고,
+        last_known_center prior로 양가설(이 선이 좌? 우?)을 판정한다. 확신이 없으면
+        (점수 차 < reacquire_margin) 그 밴드를 무효 처리한다(판정 보류).
     hugging(branch_hint != 0) 경로는 필터/게이트/EMA 대상에서 제외 — 동작 그대로 보존.
     """
     h = mask.shape[0]
@@ -92,9 +154,9 @@ def analyze_bands(mask, width, num_bands, min_pixels, split_gap,
     bands = []
     running_left = seed_left
     running_right = seed_right
-    running_center = seed_center     # 앵커가 아직 없을 때(cold start)만 쓰는 폴백
     running_line = hug_line_seed     # hugging 중 추종하는 라인 x (밴드 아래→위 연속)
     gate = half_width * anchor_gate_ratio
+    _ = seed_center                  # (mod 4) 화면중심 폴백 삭제로 미사용 — 시그니처만 유지
 
     for i in range(num_bands):
         y1 = h - i * band_h
@@ -180,19 +242,24 @@ def analyze_bands(mask, width, num_bands, min_pixels, split_gap,
                     bands.append({'valid': False, 'y': y_mid})
                     continue
             else:
-                # 앵커 없음 + 한 줄: 화면 중심 기준 폴백(임시 — mod 4에서 교체).
+                # (mod 4) 앵커 없음 + 한 줄: last_known_center prior로 양가설 판정.
+                # 화면 중심 기준 폴백(플립 원인)은 삭제. 확신 없으면 밴드 무효(판정 보류).
                 boundary = clusters[0]['cx']
-                if boundary < running_center:
+                pick = pick_side_hypothesis(
+                    boundary, half_width, width, last_known_center, reacquire_margin)
+                if pick == 'left':
                     left_x = boundary
                     weight = clusters[0]['pixels']
                     center = boundary + half_width
-                else:
+                elif pick == 'right':
                     right_x = boundary
                     weight = clusters[0]['pixels']
                     center = boundary - half_width
+                else:
+                    bands.append({'valid': False, 'y': y_mid})
+                    continue
 
         center = float(np.clip(center, 0.0, width))
-        running_center = center
         # 본 라인만 앵커 갱신(EMA+이동량 상한), 안 보인 쪽은 직전값 유지(안정적 앵커).
         # hugging 경로는 running_left/right가 이후 밴드에 쓰이지 않으므로 갱신 생략.
         if branch_hint == 0:

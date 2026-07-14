@@ -90,6 +90,9 @@ class LaneNode(Node):
         # 한쪽 라인만 보일 때 '반대편으로 넘어간' 판정(오배정 의심)이 이 프레임 수만큼
         # 연속돼야 앵커를 뒤집는다. 순간 오검출 한두 프레임으로 좌/우가 뒤집히는 것 방지.
         self.declare_parameter('flip_confirm_frames', 3)
+        # 재획득(mod 4): 앵커를 잃은 뒤 좌/우를 다시 잡는 판정 여유.
+        self.declare_parameter('hist_width_tol', 0.25)      # 히스토그램 두 피크 간격 허용오차(차선폭 대비)
+        self.declare_parameter('reacquire_margin', 0.3)     # 한쪽 라인 양가설 점수 차 하한(미만이면 판정 보류)
 
         # --- 버드아이뷰(BEV) 원근변환: ROI 폭/높이 비율(0~1)로 사다리꼴 4점 지정 ---
         # 사다리꼴 양 옆변이 두 차선을 그대로 덮도록 맞춰야 BEV가 편다.
@@ -140,6 +143,11 @@ class LaneNode(Node):
         self.flip_count = 0       # 좌/우 반전 후보가 연속된 프레임 수 (히스테리시스)
         self.prev_hug_line = None  # 직전 프레임에 hugging하던 라인 x (연속 추적 시드)
         self.lost_count = 0       # 연속으로 차선을 잃은 프레임 수
+        # (mod 4) prior는 앵커를 버려도 절대 버리지 않는다 → 재획득 시 좌/우 방향 힌트.
+        self.last_known_center = None
+        self.last_known_left = None
+        self.last_known_right = None
+        self.track_state = 'FULL_SEARCH'   # FULL_SEARCH | TRACKING | COAST | REACQUIRE
 
         self.get_logger().info(
             f'lane_node started: image_topic={image_topic}, lane_topic={lane_topic}, '
@@ -250,7 +258,9 @@ class LaneNode(Node):
             int(self.get_parameter('cluster_min_pixels').value),
             float(self.get_parameter('anchor_gate_ratio').value),
             float(self.get_parameter('anchor_alpha_band').value),
-            float(self.get_parameter('anchor_max_step_band_px').value))
+            float(self.get_parameter('anchor_max_step_band_px').value),
+            self.last_known_center,
+            float(self.get_parameter('reacquire_margin').value))
 
     # ------------------------------------------------------------------ #
     #  프레임 간 좌/우 앵커 확정 (플립 히스테리시스)
@@ -339,6 +349,18 @@ class LaneNode(Node):
 
         mask = self._build_mask(analysis_img, lane_color)
         seed_center = self.prev_center if self.prev_center is not None else width / 2.0
+
+        # (mod 4) 재획득: 앵커를 잃은(hold 초과) 상태로 이번 프레임에 진입했는지 기록.
+        # 평소(hugging 아님)에 앵커가 없으면 히스토그램 풀 서치로 두 라인을 다시 잡아
+        # 이번 프레임 시드로 넣는다. 실패하면 analyze_bands가 한쪽 라인 양가설로 시도한다.
+        anchors_missing = (self.branch_hint == 0
+                           and (self.prev_left is None or self.prev_right is None))
+        if anchors_missing:
+            peaks = lane_core.histogram_peaks(
+                mask, half_width, float(self.get_parameter('hist_width_tol').value))
+            if peaks is not None:
+                self.prev_left, self.prev_right = peaks
+
         # hugging 중이면 직전 프레임 추종 라인을 시드로(연속 추적), 아니면 None(앵커 초기화)
         hug_line_seed = self.prev_hug_line if self.branch_hint != 0 else None
         bands, hug_line = self._analyze_bands(
@@ -351,13 +373,19 @@ class LaneNode(Node):
         # 다음 프레임 시드: 가장 아래(가까운) 밴드로 좌/우 앵커를 갱신한다.
         # 평소(hugging 아님)에만 플립 히스테리시스로 앵커를 확정한다. 차선을 잠깐
         # 잃어도 앵커를 lost_hold_frames만큼 유지해야 재등장 시 좌/우가 안 뒤집힌다.
-        # 오래 잃으면(홀드 초과) 앵커를 버리고 다음 재등장 때 중앙 기준으로 재시작.
+        # (mod 4) 오래 잃으면(홀드 초과) 앵커는 버리되 last_known_*는 절대 버리지 않고,
+        # 다음 재등장 때 히스토그램/양가설 재획득의 방향 힌트로 쓴다(중앙 기준 폴백 제거).
         if valid:
             if self.branch_hint == 0:
                 self._commit_bottom_anchors(
                     valid[0], half_width,
                     int(self.get_parameter('flip_confirm_frames').value))
             self.prev_center = valid[0]['center']
+            self.last_known_center = valid[0]['center']
+            if valid[0].get('left') is not None:
+                self.last_known_left = valid[0]['left']
+            if valid[0].get('right') is not None:
+                self.last_known_right = valid[0]['right']
             self.lost_count = 0
         else:
             self.lost_count += 1
@@ -366,6 +394,18 @@ class LaneNode(Node):
                 self.prev_left = None
                 self.prev_right = None
                 self.flip_count = 0
+
+        # (mod 4) 트랙 상태 표시: 앵커 유무(진입 시점) × 이번 프레임 유효성으로 분류.
+        if self.branch_hint != 0:
+            self.track_state = 'TRACKING'          # hugging 중은 별도 추종
+        elif not anchors_missing:
+            self.track_state = 'TRACKING' if valid else 'COAST'
+        elif valid:
+            self.track_state = 'REACQUIRE'         # 앵커 없이 진입 → 이번에 재획득 성공
+        elif self.last_known_center is not None:
+            self.track_state = 'REACQUIRE'         # 재획득 시도 중(아직 실패)
+        else:
+            self.track_state = 'FULL_SEARCH'       # 진짜 cold start / prior 없음
 
         # hugging 라인 연속 추적 시드: 마지막으로 알던 추종 라인 위치(사라짐 구간에도 유지).
         # hugging 아니면 리셋해 다음 hugging 시작 때 최외곽 라인으로 재앵커.

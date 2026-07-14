@@ -85,6 +85,9 @@ lane_node:
     anchor_alpha_frame: 0.35    # 프레임 간 EMA 계수 (↓=프레임 튐에 더 둔감)
     anchor_max_step_frame_px: 15 # 프레임 간 이동량 상한(px)
     flip_confirm_frames: 3      # 좌/우 반전을 확정하는 연속 프레임 수 (↑=더 끈질기게 유지)
+    # --- 재획득(mod 4): 앵커 잃은 뒤 좌/우 다시 잡기 ---
+    hist_width_tol: 0.25        # 히스토그램 두 피크 간격 허용오차(차선폭 대비). ↑=관대
+    reacquire_margin: 0.3       # 한쪽 라인 양가설 점수 차 하한 (미만이면 판정 보류)
     hug_bias_px: 90             # 갈림길 hugging 시 라인에서 떨어지는 정도(BEV px)
     # --- BEV 사다리꼴 (트랙 실측 튜닝값) ---
     bev_top_left: 0.1
