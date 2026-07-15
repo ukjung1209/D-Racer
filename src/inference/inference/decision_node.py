@@ -8,13 +8,16 @@
   camera ─┬─ lane_node   → /lane/state          ─┐
           ├─ object_node → /object/detections    ─┼─ decision_node → /control
           └─ camera/image/compressed ────────────┘   └→ /lane/branch_hint
+  · object_node는 YOLO 추론(신호등/표지판)만 한다.
+  · 동적 장애물 아루코 마커(6X6_50) 검출은 decision_node가 camera/image에서 단독으로
+    수행한다(object_node엔 아루코 경로가 없다). 빨강 구간 감지도 여기서 직접 한다.
 
 ── 대회 순서(순방향)는 트랙 배치가 강제한다 (별도 시퀀서 없음) ──
   0. 빨간불 대기   : 신호등 STOPPED로 시작 → 초록 전엔 스로틀 0
   1. 초록불 출발   : green 연속 → GO
   2. S자 코스     : 곡률 가변속도(직선 빠르게 / 코너 미리 감속) + 슬루 제한
-  3. 갈림길       : left/right 표지판 보이면 즉시 그 라인 hugging + 1회 stop-and-go
-  4. 동적 장애물   : 빨강 구간 감속 → 아루코 정지 → 통과 후 가속
+  3. 갈림길       : left/right 표지판 투표 확정 시 그 라인 hugging(정지 없이 통과)
+  4. 동적 장애물   : 빨강 구간 감속 → 아루코 정지 → 마커 통과 후 CRUISE 복귀
   5. 빨간불 정지   : red 연속 → STOPPED (도착)
   갈림길 표지판·빨강 바닥·아루코는 각 구간에만 나타나므로, 아래 스로틀 중재만으로
   순서가 저절로 지켜진다(단계 카운터가 어긋날 위험이 없다).
@@ -29,7 +32,7 @@
     · 신호등 STOPPED      → 0   (초록 전/도착)
     · 동적장애물 STOP     → 0   (아루코 정지)
     · 동적장애물 APPROACH → cruise × slow_factor  (빨강 구간 감속)
-    · 갈림길 stop-and-go  → 0   (표지판 앞 1회 정지)
+    · 갈림길 stop-and-go  → 0   (표지판 앞 1회 정지; 기본 sign_stop_sec=0으로 미사용)
   target에 슬루 제한(_slew_throttle): 가속은 완만, 감속/정지는 즉시.
   → 모든 정지(신호등/갈림길/장애물)가 0으로 통일돼, 재출발 시 항상 0부터 부드럽게
     가속한다(S자 변곡점 순간 가속 튐 방지).
@@ -50,11 +53,14 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from std_msgs.msg import Int8
 from sensor_msgs.msg import CompressedImage
 from control_msgs.msg import Control
 from inference_msgs.msg import LaneState, DetectionArray
+
+from inference import decision_core
 
 
 def get_default_vehicle_config_path():
@@ -70,7 +76,17 @@ def clamp(value, low, high):
 
 
 class DecisionNode(Node):
-    """곡률 가변속도 PD 위에 신호등/갈림길/동적장애물을 얹어 /control을 낸다."""
+    """곡률 가변속도 PD 위에 신호등/갈림길/동적장애물을 얹어 /control을 낸다.
+
+    ⚠️ 이 노드는 SingleThreadedExecutor 전제로 설계됨. 콜백들(lane/detection/image)과
+    control_loop 타이머가 락 없이 공유 상태(self.obstacle_state, self.latched_dir,
+    투표 카운터 vote_green/vote_red/red_votes/aruco_votes 등)를 읽고 쓴다. 단일 스레드라
+    이들이 서로 겹쳐 실행되지 않아 안전한 것이므로, MultiThreadedExecutor로 바꾸면
+    상태머신이 깨진다(투표/전이 도중 다른 콜백이 끼어들어 레이스).
+
+    순수 판단 로직(상태머신·스로틀 중재·표지판 선택)은 decision_core.py로 분리해
+    pytest로 검증한다. 이 노드는 ROS 파라미터/타임스탬프/로그만 처리하는 얇은 래퍼다.
+    """
 
     def __init__(self):
         super().__init__('decision_node')
@@ -120,11 +136,22 @@ class DecisionNode(Node):
         # --- 좌/우 갈림길 (단순화: 표지판 보이면 즉시 그 라인 hugging + 1회 stop-and-go) ---
         self.declare_parameter('sign_conf_min', 0.5)      # 표지판 최소 confidence
         self.declare_parameter('sign_area_min', 0.01)     # 이 크기 이상이어야 방향 인정(멀면 무시)
-        self.declare_parameter('hug_hold_sec', 1.0)       # 표지판 놓치고 이 시간 뒤 hugging 해제
-        self.declare_parameter('sign_stop_sec', 0.7)      # 표지판 앞 정지 시간(stop-and-go), 0=끔
+        # (C-3) hugging 해제는 빨강 구간 진입(트랙 랜드마크)이 주 경로, 시간 해제는 폴백 →
+        # 기본 4.0으로 늘려 갈림길 한복판에서 시간으로 조기 해제되는 것을 막는다.
+        self.declare_parameter('hug_hold_sec', 4.0)       # 표지판 놓치고 이 시간 뒤 hugging 해제(폴백)
+        # (C-2) 갈림길 stop-and-go 미사용 결정 → 기본 0.0(정지 끔). 정지 로직 코드는 유지해
+        # 실차에서 표지판 인식이 불안정하면 파라미터로 재활성화할 수 있게 남겨 둔다.
+        self.declare_parameter('sign_stop_sec', 0.0)      # 표지판 앞 정지 시간(stop-and-go), 0=끔
         self.declare_parameter('stop_lane_conf_min', 0.5)  # 두 차선 이 conf 이상일 때만 정지
 
         # --- 동적 장애물 (camera/image에서 OpenCV로 직접 감지) ---
+        # 처리율 제한: N프레임당 1장만 감지(빨강+아루코). 아루코 검출이 무거워
+        # (2배 업스케일 + CLAHE + subpix) 매 프레임 돌면 SingleThreadedExecutor에서
+        # 20Hz control_loop 타이머를 밀어 조향 지터를 만든다. 3이면 30fps→10Hz.
+        # ⚠️ red_votes_needed_obstacle / aruco_votes_needed는 '연속 관측 표수'라
+        #    감지 주기가 30→10Hz로 바뀌면 같은 표수가 3배의 실시간을 의미한다
+        #    (표수 기본값은 사람이 튜닝한다 — 여기서 바꾸지 마라).
+        self.declare_parameter('obstacle_process_every_n', 3)
         self.declare_parameter('slow_factor', 0.7)          # 빨강 구간 감속 배율(cruise 대비)
         self.declare_parameter('red_roi_top_frac', 0.5)     # 빨강 ROI 상단 시작(높이 비율)
         self.declare_parameter('red_h_lo', 8)               # H 0근방 상한
@@ -167,7 +194,9 @@ class DecisionNode(Node):
         self.lane_state = None
         self.lane_stamp = None
         self.detections = None
-        self.prev_offset = 0.0
+        # None = D항 보호(차선 상실/첫 프레임). 재획득 첫 tick에 derivative=offset-0의
+        # 가짜 조향 킥이 들어가지 않도록, None이면 그 tick D항을 0으로 처리한다.
+        self.prev_offset = None
         self.prev_throttle = 0.0       # 직전 tick throttle (가속 슬루 제한 기준)
 
         # --- 신호등 상태머신 ---
@@ -177,12 +206,13 @@ class DecisionNode(Node):
 
         # --- 갈림길 상태 (단순화) ---
         self.latched_dir = 0           # +1 = left, -1 = right, 0 = 평소 양쪽 추종
+        self.sign_history = []         # (C-1) 최근 표지판 방향 투표 히스토리(오래된 것부터)
         self.last_sign_time = None     # 표지판을 마지막으로 본 시각
         self.stop_start = None         # 정지 시작 시각, None=정지 안 함
         self.stopped_done = False      # 이번 갈림길 정지 완료 여부(1회)
 
         # --- 동적 장애물 상태머신 ---
-        self.obstacle_state = 'CRUISE'  # CRUISE | APPROACH | STOP | BOOST
+        self.obstacle_state = 'CRUISE'  # CRUISE | APPROACH | STOP
         self.red_votes = 0
         self.aruco_votes = 0
         self.last_red_time = None
@@ -193,14 +223,23 @@ class DecisionNode(Node):
         self.aruco_boxes = []
         self.aruco_raw_ids = []
         self.lanes_visible = False
+        self._obstacle_frame_count = 0   # image_callback 처리율 제한 카운터
 
         self._init_aruco()
 
         self.create_subscription(LaneState, lane_topic, self.lane_callback, 10)
         self.create_subscription(
             DetectionArray, detection_topic, self.detection_callback, 10)
+        # 아루코 정지 판단이 밀린 묵은 프레임으로 이뤄지면 정지가 늦는다. object_node와
+        # 동일하게 최신 1장만 처리(KEEP_LAST/depth=1/BEST_EFFORT). BEST_EFFORT 구독은
+        # camera_node의 RELIABLE 발행과 호환된다(구독이 더 느슨).
+        image_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+        )
         self.create_subscription(
-            CompressedImage, image_topic, self.image_callback, 10)
+            CompressedImage, image_topic, self.image_callback, image_qos)
         self.control_pub = self.create_publisher(Control, control_topic, 10)
         self.branch_hint_pub = self.create_publisher(Int8, branch_hint_topic, 10)
         self.debug_pub = self.create_publisher(CompressedImage, debug_topic, 10)
@@ -246,6 +285,12 @@ class DecisionNode(Node):
         """동적장애물: 카메라 원본에서 빨강 구간 + 아루코를 OpenCV로 직접 감지."""
         if not bool(self.get_parameter('enable_obstacle_mission').value):
             return
+        # 처리율 제한: N프레임당 1장만 감지. 대상 프레임이 아니면 imdecode 전에 즉시
+        # return해 디코딩 비용 자체를 아낀다(무거운 아루코 검출이 control_loop를 미는 것 방지).
+        every_n = max(1, int(self.get_parameter('obstacle_process_every_n').value))
+        self._obstacle_frame_count += 1
+        if self._obstacle_frame_count % every_n != 0:
+            return
         raw = np.frombuffer(msg.data, dtype=np.uint8)
         frame = cv2.imdecode(raw, cv2.IMREAD_COLOR)
         if frame is None:
@@ -275,19 +320,29 @@ class DecisionNode(Node):
             self.aruco_votes = 0
 
         # 이벤트 기반 전이 (시간 기반은 control_loop의 _update_obstacle_time)
-        if self.obstacle_state == 'CRUISE':
-            if self.red_votes >= int(self.get_parameter('red_votes_needed_obstacle').value):
-                self.get_logger().info(
-                    f'obstacle: CRUISE → APPROACH (red_ratio={self.red_ratio:.3f})')
-                self.obstacle_state = 'APPROACH'
-                self.red_votes = 0
-        elif self.obstacle_state == 'APPROACH':
-            if self.aruco_votes >= int(self.get_parameter('aruco_votes_needed').value):
-                mid = max((b[4] for b in self.aruco_boxes), default=0.0)
-                self.get_logger().info(
-                    f'obstacle: APPROACH → STOP (aruco area={mid:.3f})')
-                self.obstacle_state = 'STOP'
-                self.aruco_votes = 0
+        self.obstacle_state, self.red_votes, self.aruco_votes, transition = (
+            decision_core.update_obstacle_event(
+                self.obstacle_state, self.red_votes, self.aruco_votes,
+                int(self.get_parameter('red_votes_needed_obstacle').value),
+                int(self.get_parameter('aruco_votes_needed').value)))
+        if transition == 'CRUISE_TO_APPROACH':
+            self.get_logger().info(
+                f'obstacle: CRUISE → APPROACH (red_ratio={self.red_ratio:.3f})')
+            # (C-3) 갈림길 다음 미션(빨강 구간) 진입 = 갈림길 통과 확정 → hugging 해제.
+            # 시간 기반 해제(_release_hug_if_sign_lost)보다 이 트랙 랜드마크 전이가
+            # 우선한다(갈림길 한복판에서 시간으로 풀리는 것 방지). fork가 꺼져 있으면
+            # latched_dir은 이미 0이라 no-op.
+            if self.latched_dir != 0:
+                self.get_logger().info('fork passed (red zone) → release hug')
+                self.latched_dir = 0
+                self.last_sign_time = None
+                self.stopped_done = False
+                self.stop_start = None
+                self.sign_history = []
+        elif transition == 'APPROACH_TO_STOP':
+            mid = max((b[4] for b in self.aruco_boxes), default=0.0)
+            self.get_logger().info(
+                f'obstacle: APPROACH → STOP (aruco area={mid:.3f})')
 
         if self.publish_debug:
             self._publish_debug(frame, msg)
@@ -306,45 +361,45 @@ class DecisionNode(Node):
         green = self._has_light(msg, 'green')
         red = self._has_light(msg, 'red')
 
-        if self.light_state == 'STOPPED':
-            self.vote_green = self.vote_green + 1 if green else 0
-            self.vote_red = 0
-            if self.vote_green >= int(self.get_parameter('green_votes_needed').value):
+        new_state, self.vote_green, self.vote_red, transitioned = (
+            decision_core.update_light_state(
+                self.light_state, self.vote_green, self.vote_red, green, red,
+                int(self.get_parameter('green_votes_needed').value),
+                int(self.get_parameter('red_votes_needed_light').value)))
+        if transitioned:
+            if new_state == 'GO':
                 self.get_logger().info('light: STOPPED → GO (green)')
-                self.light_state = 'GO'
-                self.vote_green = 0
-        elif self.light_state == 'GO':
-            self.vote_red = self.vote_red + 1 if red else 0
-            self.vote_green = 0
-            if self.vote_red >= int(self.get_parameter('red_votes_needed_light').value):
+            else:
                 self.get_logger().info('light: GO → STOPPED (red)')
-                self.light_state = 'STOPPED'
-                self.vote_red = 0
+        self.light_state = new_state
 
     # ================================================================== #
     #  갈림길: 표지판 보이면 즉시 그 라인 hugging + 1회 stop-and-go
     # ================================================================== #
     def _pick_sign(self, msg: DetectionArray):
-        """left/right 중 conf·크기 조건을 통과한 가장 큰(가까운) 표지판."""
+        """left/right 중 conf·크기 조건을 통과한 가장 큰(가까운) 표지판.
+        반환: (class_name, confidence, area_ratio) 튜플 또는 None."""
         conf_min = float(self.get_parameter('sign_conf_min').value)
         area_min = float(self.get_parameter('sign_area_min').value)
-        best = None
-        for det in msg.detections:
-            if det.class_name not in ('left', 'right'):
-                continue
-            if det.confidence < conf_min or det.area_ratio < area_min:
-                continue
-            if best is None or det.area_ratio > best.area_ratio:
-                best = det
-        return best
+        dets = [(d.class_name, d.confidence, d.area_ratio) for d in msg.detections]
+        return decision_core.pick_sign(dets, conf_min, area_min)
 
     def _update_sign_latch(self, msg: DetectionArray):
-        """표지판이 보이면 즉시 그 방향으로 hugging 시작 (투표/상태머신 없음)."""
+        """표지판 방향을 투표로 확정해 그 방향으로 hugging을 시작한다.
+
+        (C-1) 1프레임 즉시 래치는 표지판 1프레임 오검출로 오발사된다. 최근 검출 투표
+        (update_sign_vote: 최근 3회 중 2회 이상 동일, 반대 클래스는 리셋)로 방향이
+        확정됐을 때만 latched_dir을 바꾼다. 확정 전(direction=0)이면 래치하지 않는다.
+        """
         best = self._pick_sign(msg)
         if best is None:
             return
+        name, conf, area = best
         self.last_sign_time = self.get_clock().now()
-        direction = 1 if best.class_name == 'left' else -1
+        self.sign_history, direction = decision_core.update_sign_vote(
+            self.sign_history, name)
+        if direction == 0:
+            return
         if direction != self.latched_dir:
             was_cruise = (self.latched_dir == 0)
             self.latched_dir = direction
@@ -352,37 +407,41 @@ class DecisionNode(Node):
                 self.stopped_done = False   # 새 갈림길 진입 → 정지 재무장
             self.get_logger().info(
                 f'sign → hug {"LEFT" if direction == 1 else "RIGHT"} '
-                f'(conf={best.confidence:.2f}, area={best.area_ratio:.3f})')
+                f'(conf={conf:.2f}, area={area:.3f})')
 
-    def _release_hug_if_sign_lost(self):
-        """표지판을 hug_hold_sec 이상 못 보면 hugging 해제 → 평소 양쪽 추종."""
+    def _release_hug_if_sign_lost(self, p):
+        """표지판을 hug_hold_sec 이상 못 보면 hugging 해제 → 평소 양쪽 추종.
+        (C-3) 주 해제 경로는 빨강 구간 진입(image_callback)이고, 이 시간 기반 해제는
+        그게 안 잡힐 때의 폴백이다(hug_hold_sec 기본 4.0으로 늘려 갈림길 한복판 조기
+        해제를 막음). (p: control_loop이 tick당 1회 읽어 넘긴 파라미터 dict — 규칙 3)"""
         if self.latched_dir == 0 or self.last_sign_time is None:
             return
         gone = (self.get_clock().now() - self.last_sign_time).nanoseconds / 1e9
-        if gone >= float(self.get_parameter('hug_hold_sec').value):
+        if gone >= p['hug_hold_sec']:
             self.get_logger().info('sign lost → release hug (cruise)')
             self.latched_dir = 0
             self.last_sign_time = None
             self.stopped_done = False
             self.stop_start = None
+            self.sign_history = []
 
-    def _fork_stopping(self):
+    def _fork_stopping(self, p):
         """갈림길 stop-and-go: 표지판 hugging 중 + 두 차선 확실할 때 1회 정지.
-        현재 정지 중이면 True를 돌려 스로틀 0을 먹인다."""
-        if not bool(self.get_parameter('enable_fork_mission').value):
+        현재 정지 중이면 True를 돌려 스로틀 0을 먹인다.
+        (p: control_loop이 tick당 1회 읽어 넘긴 파라미터 dict — 규칙 3)"""
+        if not p['enable_fork_mission']:
             return False
         now = self.get_clock().now()
         # 정지 트리거 (조건 충족 시 이번 갈림길 1회)
         if (self.latched_dir != 0 and not self.stopped_done and self.stop_start is None
-                and float(self.get_parameter('sign_stop_sec').value) > 0.0
+                and p['sign_stop_sec'] > 0.0
                 and self._lane_is_fresh() and self.lane_state.detected
-                and self.lane_state.confidence
-                >= float(self.get_parameter('stop_lane_conf_min').value)):
+                and self.lane_state.confidence >= p['stop_lane_conf_min']):
             self.stop_start = now
         # 정지 실행
         if self.stop_start is not None:
             elapsed = (now - self.stop_start).nanoseconds / 1e9
-            if elapsed < float(self.get_parameter('sign_stop_sec').value):
+            if elapsed < p['sign_stop_sec']:
                 return True
             self.stop_start = None
             self.stopped_done = True
@@ -515,30 +574,33 @@ class DecisionNode(Node):
             boxes.append((x1, y1, x2, y2, area_ratio, marker_id))
         return boxes
 
-    def _update_obstacle_time(self):
-        """STOP→BOOST(마커 통과), BOOST→CRUISE(구간 이탈), APPROACH→CRUISE(빨강 오검출)."""
+    def _update_obstacle_time(self, p):
+        """STOP→CRUISE(마커 통과 → 재출발), APPROACH→CRUISE(빨강 오검출).
+        경과시간 계산은 여기서(노드), 전이 판단은 decision_core에 위임.
+        (p: control_loop이 tick당 1회 읽어 넘긴 파라미터 dict — 규칙 3)"""
         now = self.get_clock().now()
         red_gone = (self.last_red_time is None or
                     (now - self.last_red_time).nanoseconds / 1e9
-                    >= float(self.get_parameter('red_clear_time_sec').value))
+                    >= p['red_clear_time_sec'])
+        # 마커를 봤었고(last_aruco_time 존재) clear_time_sec 이상 안 보임
+        aruco_gone = (self.last_aruco_time is not None and
+                      (now - self.last_aruco_time).nanoseconds / 1e9
+                      >= p['clear_time_sec'])
 
-        if self.obstacle_state == 'STOP':
-            if self.last_aruco_time is not None:
-                gone = (now - self.last_aruco_time).nanoseconds / 1e9
-                if gone >= float(self.get_parameter('clear_time_sec').value):
-                    self.get_logger().info('obstacle: STOP → BOOST (marker passed)')
-                    self.obstacle_state = 'BOOST'
-                    self.aruco_votes = 0
-        elif self.obstacle_state == 'BOOST':
-            if red_gone:
-                self.get_logger().info('obstacle: BOOST → CRUISE (zone cleared)')
-                self.obstacle_state = 'CRUISE'
-                self.red_votes = 0
-        elif self.obstacle_state == 'APPROACH':
-            if red_gone:
-                self.get_logger().info('obstacle: APPROACH → CRUISE (red lost)')
-                self.obstacle_state = 'CRUISE'
-                self.red_votes = 0
+        new_state, transition = decision_core.update_obstacle_time(
+            self.obstacle_state, red_gone, aruco_gone)
+        if transition == 'STOP_TO_CRUISE':
+            self.get_logger().info('obstacle: STOP → CRUISE (marker passed)')
+            # STOP에서 바로 재출발하므로 다음 미션을 위해 aruco/red 표수를 둘 다 비운다.
+            self.aruco_votes = 0
+            self.red_votes = 0
+            # 주의: STOP→CRUISE 직후 아직 빨강 구간 안이면 red 재검출로 다시 APPROACH에
+            # 들어갈 수 있으나 이는 의도된 동작이다(감속 유지). STOP 재진입은 aruco
+            # 재검출이 있어야만 하므로(APPROACH→STOP 경로) 마커 없이 다시 멈추진 않는다.
+        elif transition == 'APPROACH_TO_CRUISE':
+            self.get_logger().info('obstacle: APPROACH → CRUISE (red lost)')
+            self.red_votes = 0
+        self.obstacle_state = new_state
 
     # ================================================================== #
     #  조향 PD + 곡률 가변속도 (미션 공통)
@@ -550,70 +612,93 @@ class DecisionNode(Node):
         age = (self.get_clock().now() - self.lane_stamp).nanoseconds / 1e9
         return age <= timeout
 
-    def _lane_pd_steer(self, trim):
+    def _lane_pd_steer(self, trim, p):
         if not (self._lane_is_fresh() and self.lane_state.detected):
             return None
-        kp = float(self.get_parameter('steer_kp').value)
-        kd = float(self.get_parameter('steer_kd').value)
-        ka = float(self.get_parameter('steer_ka').value)
-        sign = float(self.get_parameter('steering_sign').value)
+        kp = p['steer_kp']
+        kd = p['steer_kd']
+        ka = p['steer_ka']
+        sign = p['steering_sign']
         offset = self.lane_state.offset
         angle = self.lane_state.angle
-        derivative = offset - self.prev_offset
+        # 재획득 첫 tick(prev_offset=None)엔 D항을 0으로. prev_offset을 현재 offset으로
+        # 채워 다음 tick부터 정상 미분. (offset-0의 가짜 킥 방지)
+        if self.prev_offset is None:
+            derivative = 0.0
+        else:
+            derivative = offset - self.prev_offset
         self.prev_offset = offset
         return sign * (kp * offset + kd * derivative + ka * angle) + trim
 
-    def _curve_throttle(self, base):
-        """직선은 base로 빠르게, 코너는 미리 감속. angle(예측)+offset(보정) 기반."""
+    def _curve_throttle(self, base, p):
+        """직선은 base로 빠르게, 코너는 미리 감속. angle(예측)+offset(보정) 기반.
+        (freshness 판정은 노드, 속도식은 decision_core에 위임)
+        (p: control_loop이 tick당 1회 읽어 넘긴 파라미터 dict — 규칙 3)"""
         if not (self._lane_is_fresh() and self.lane_state.detected):
             return base
-        ka = float(self.get_parameter('speed_ka').value)
-        ko = float(self.get_parameter('speed_ko').value)
-        curve = ka * abs(self.lane_state.angle) + ko * abs(self.lane_state.offset)
-        target = base * (1.0 - curve)
-        return clamp(target, float(self.get_parameter('min_throttle').value), base)
+        return decision_core.curve_throttle(
+            base, self.lane_state.angle, self.lane_state.offset,
+            p['speed_ka'], p['speed_ko'], p['min_throttle'])
 
-    def _slew_throttle(self, target):
-        """가속은 슬루 제한(완만), 감속은 즉시. (min_throttle 하한/정지는 control_loop에서 처리)"""
-        max_up = float(self.get_parameter('throttle_accel_rate').value) * self.command_dt
-        if target > self.prev_throttle + max_up:
-            out = self.prev_throttle + max_up
-        else:
-            out = target
+    def _slew_throttle(self, target, p):
+        """가속은 슬루 제한(완만), 감속은 즉시. (min_throttle 하한/정지는 control_loop에서 처리)
+        (p: control_loop이 tick당 1회 읽어 넘긴 파라미터 dict — 규칙 3)"""
+        max_up = p['throttle_accel_rate'] * self.command_dt
+        out = decision_core.slew_throttle(target, self.prev_throttle, max_up)
         self.prev_throttle = out
         return out
 
     # ================================================================== #
     #  스로틀 중재: cruise(가변속도)를 미션 목표들의 min으로 깎는다
     # ================================================================== #
-    def _arbitrate_throttle(self, cruise, fork_stopping):
-        target = cruise
-        if bool(self.get_parameter('enable_light_mission').value):
-            if self.light_state == 'STOPPED':
-                target = min(target, 0.0)           # 초록 전 / 도착
-        if bool(self.get_parameter('enable_obstacle_mission').value):
-            if self.obstacle_state == 'STOP':
-                target = min(target, 0.0)           # 아루코 정지
-            elif self.obstacle_state == 'APPROACH':
-                target = min(target, cruise * float(self.get_parameter('slow_factor').value))
-            # CRUISE / BOOST → 제약 없음
-        if fork_stopping:
-            target = min(target, 0.0)               # 갈림길 stop-and-go
-        return target
+    def _arbitrate_throttle(self, cruise, fork_stopping, p):
+        """cruise를 미션 목표들의 min으로 깎는다. 미션 enable 게이팅은 여기서 인자에
+        반영해 decision_core.arbitrate_throttle에 넘긴다(끈 미션은 제약 없게).
+        (p: control_loop이 tick당 1회 읽어 넘긴 파라미터 dict — 규칙 3)"""
+        light_stopped = p['enable_light_mission'] and self.light_state == 'STOPPED'
+        # 장애물 미션이 꺼져 있으면 'CRUISE'를 넘겨 STOP/APPROACH 제약이 안 걸리게 한다.
+        obstacle_state = (self.obstacle_state
+                          if p['enable_obstacle_mission'] else 'CRUISE')
+        return decision_core.arbitrate_throttle(
+            cruise, light_stopped, obstacle_state, p['slow_factor'], fork_stopping)
 
     def control_loop(self):
+        # 이 tick에 필요한 파라미터를 여기서 한 번씩만 읽어 하위 함수에 dict로 넘긴다.
+        # (control_loop 경로 전용 최적화 — 콜백 경로에서 읽는 파라미터는 live 튜닝 유지를
+        #  위해 건드리지 않는다. 규칙 3. 읽는 위치만 바뀔 뿐 동작은 100% 동일하다.)
+        p = {
+            'enable_light_mission': bool(self.get_parameter('enable_light_mission').value),
+            'enable_fork_mission': bool(self.get_parameter('enable_fork_mission').value),
+            'enable_obstacle_mission': bool(self.get_parameter('enable_obstacle_mission').value),
+            'steer_trim': float(self.get_parameter('steer_trim').value),
+            'base_throttle': float(self.get_parameter('base_throttle').value),
+            'min_throttle': float(self.get_parameter('min_throttle').value),
+            'steer_kp': float(self.get_parameter('steer_kp').value),
+            'steer_kd': float(self.get_parameter('steer_kd').value),
+            'steer_ka': float(self.get_parameter('steer_ka').value),
+            'steering_sign': float(self.get_parameter('steering_sign').value),
+            'speed_ka': float(self.get_parameter('speed_ka').value),
+            'speed_ko': float(self.get_parameter('speed_ko').value),
+            'throttle_accel_rate': float(self.get_parameter('throttle_accel_rate').value),
+            'slow_factor': float(self.get_parameter('slow_factor').value),
+            'hug_hold_sec': float(self.get_parameter('hug_hold_sec').value),
+            'sign_stop_sec': float(self.get_parameter('sign_stop_sec').value),
+            'stop_lane_conf_min': float(self.get_parameter('stop_lane_conf_min').value),
+            'red_clear_time_sec': float(self.get_parameter('red_clear_time_sec').value),
+            'clear_time_sec': float(self.get_parameter('clear_time_sec').value),
+        }
+
         # 시간 기반 상태 전이
-        if bool(self.get_parameter('enable_fork_mission').value):
-            self._release_hug_if_sign_lost()
-        if bool(self.get_parameter('enable_obstacle_mission').value):
-            self._update_obstacle_time()
+        if p['enable_fork_mission']:
+            self._release_hug_if_sign_lost(p)
+        if p['enable_obstacle_mission']:
+            self._update_obstacle_time(p)
 
         # 갈림길 hugging 힌트: latched_dir(±1) → lane_node가 그 라인만 hugging (0=평소)
-        hint = (self.latched_dir
-                if bool(self.get_parameter('enable_fork_mission').value) else 0)
+        hint = self.latched_dir if p['enable_fork_mission'] else 0
         self.branch_hint_pub.publish(Int8(data=int(hint)))
 
-        trim = float(self.get_parameter('steer_trim').value)
+        trim = p['steer_trim']
         if math.isnan(trim):
             trim = float(self.vehicle_config.get('STEER_TRIM', 0.0))
 
@@ -621,13 +706,14 @@ class DecisionNode(Node):
         control.header.stamp = self.get_clock().now().to_msg()
         control.header.frame_id = 'decision'
 
-        min_throttle = float(self.get_parameter('min_throttle').value)
+        min_throttle = p['min_throttle']
 
-        pd_steer = self._lane_pd_steer(trim)
+        pd_steer = self._lane_pd_steer(trim, p)
 
         if pd_steer is None:
             # 차선을 잃으면 안전 정지. 재출발은 min_throttle부터(데드밴드 0~min 건너뜀).
-            self.prev_offset = 0.0
+            # prev_offset은 0.0이 아니라 None으로 리셋 → 재획득 첫 tick D항 킥 방지.
+            self.prev_offset = None
             self.prev_throttle = min_throttle
             control.steering = float(clamp(trim, -1.0, 1.0))
             control.throttle = 0.0
@@ -636,8 +722,8 @@ class DecisionNode(Node):
 
         control.steering = float(clamp(pd_steer, -1.0, 1.0))
 
-        cruise = self._curve_throttle(float(self.get_parameter('base_throttle').value))
-        target = self._arbitrate_throttle(cruise, self._fork_stopping())
+        cruise = self._curve_throttle(p['base_throttle'], p)
+        target = self._arbitrate_throttle(cruise, self._fork_stopping(p), p)
         if target <= 0.0:
             # 완전 정지(정지 미션). 재출발은 min_throttle부터 → 데드밴드 구간 안 지나감.
             control.throttle = 0.0
@@ -645,7 +731,7 @@ class DecisionNode(Node):
         else:
             # 움직일 땐 min_throttle 이상 보장(모터 데드밴드 회피) + 가속 슬루 제한.
             # → 출력은 {0(완전정지)} ∪ [min_throttle, base] 범위로 보장됨.
-            control.throttle = float(self._slew_throttle(max(target, min_throttle)))
+            control.throttle = float(self._slew_throttle(max(target, min_throttle), p))
 
         self.control_pub.publish(control)
 

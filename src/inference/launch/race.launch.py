@@ -157,7 +157,7 @@ def generate_launch_description():
         #   Image Status = 차선 인지(/lane/debug/bev)
         #   Gray Scale   = YOLO(/object/debug: 신호등/표지판 박스)
         #   BLUR         = 아루코(/obstacle/debug: 빨강 ROI/마커/미션 상태)
-        #   EDGE         = 없음
+        #   EDGE         = BEV 사다리꼴(/lane/debug/raw: 원본 ROI + 초록 변환영역)
         Node(
             package='monitor',
             executable='monitor_node',
@@ -171,7 +171,7 @@ def generate_launch_description():
                     'image_topic': '/lane/debug/bev',              # Image Status = 차선 인지
                     'opencv_grayscale_topic': '/object/debug',     # Gray Scale = YOLO
                     'opencv_blur_topic': '/obstacle/debug',        # BLUR = 아루코
-                    'opencv_edge_topic': '',                       # EDGE = 없음
+                    'opencv_edge_topic': '/lane/debug/raw',        # EDGE = BEV 사다리꼴
                 },
             ],
         ),

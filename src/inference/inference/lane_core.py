@@ -35,6 +35,8 @@ def extract_clusters(band, split_gap):
 
     각 클러스터 dict:
       'cx'     : 멤버 열의 평균 x
+      'x_min'  : 첫(최좌) 열 x  → 좌-hug의 바깥 모서리(분리섬 병합에도 진짜 차선 위)
+      'x_max'  : 마지막(최우) 열 x → 우-hug의 바깥 모서리
       'width'  : 열 폭(마지막 열 − 첫 열)  → 십자 가로획(넓음) 판별용
       'pixels' : 실제 흰 픽셀 수(열별 nonzero 합, '열 수'가 아님) → 잡음 조각 판별용
     필터는 여기서 하지 않는다(hugging은 원본 클러스터가 필요) — 호출 측에서 거른다.
@@ -51,6 +53,8 @@ def extract_clusters(band, split_gap):
         cols = xs[bounds[k]:bounds[k + 1]]
         clusters.append({
             'cx': float(cols.mean()),
+            'x_min': float(cols[0]),
+            'x_max': float(cols[-1]),
             'width': float(cols[-1] - cols[0]),
             'pixels': int(col_counts[cols].sum()),
         })
@@ -123,7 +127,7 @@ def histogram_peaks(mask, half_width, width_tol):
 # ------------------------------------------------------------------ #
 #  가로 밴드별로 좌/우 라인 분리 → 차선 중심 추정 (아래→위 전파)
 # ------------------------------------------------------------------ #
-def analyze_bands(mask, width, num_bands, min_pixels, split_gap,
+def analyze_bands(mask, width, num_bands, split_gap,
                   half_width, seed_center, seed_left, seed_right,
                   branch_hint, hug_bias, hug_line_seed, hug_track_tol,
                   cluster_max_width_px, cluster_min_pixels, anchor_gate_ratio,
@@ -147,7 +151,12 @@ def analyze_bands(mask, width, num_bands, min_pixels, split_gap,
       · 앵커 없이 한 줄만 보이는 밴드는 '화면 중심 기준' 폴백(플립 원인)을 버리고,
         last_known_center prior로 양가설(이 선이 좌? 우?)을 판정한다. 확신이 없으면
         (점수 차 < reacquire_margin) 그 밴드를 무효 처리한다(판정 보류).
-    hugging(branch_hint != 0) 경로는 필터/게이트/EMA 대상에서 제외 — 동작 그대로 보존.
+    hugging(branch_hint != 0) 경로(A-2/A-3, 분리섬 오염 방지):
+      · 클러스터 대표값을 cx가 아니라 바깥 모서리(좌-hug x_min / 우-hug x_max)로 잡아
+        분리섬 V자와 병합돼도 cx처럼 안쪽으로 끌려가지 않게 한다.
+      · running_line 갱신은 |nearest − running_line| ≤ hug_track_tol일 때만(방향 불문),
+        그것도 raw 대입이 아니라 ema_step으로 흡수. 픽셀수 하한은 적용, 폭 필터는 미적용.
+      · 평시 게이트/역전 폴백/양가설(mod 1·4)은 hugging에 관여하지 않는다.
     """
     h = mask.shape[0]
     band_h = max(1, h // num_bands)
@@ -175,17 +184,26 @@ def analyze_bands(mask, width, num_bands, min_pixels, split_gap,
         rejected = []          # (mod 6) 필터에 걸린 클러스터 cx (디버그 회색 X)
 
         if branch_hint != 0:
-            # ── hugging: 원본(미필터) 클러스터로 기존 동작 그대로 보존 ──
-            clusters = [c['cx'] for c in raw]
+            # ── hugging: 지시 방향 최외곽 라인 하나만 추종 ──
+            # (A-2) 대표값을 cx가 아니라 '바깥 모서리'로 잡는다: 좌-hug(>0)는 x_min,
+            #   우-hug(<0)는 x_max. 분리섬 V자 빗변과 병합돼 뚱뚱해진 클러스터라도 바깥
+            #   모서리는 진짜 차선 위에 남으므로 cx처럼 안쪽으로 끌려가지 않는다.
+            # (A-3c) 픽셀 적은 잡음/반사 조각은 후보에서 제외한다. 단 폭 필터
+            #   (cluster_max_width_px)는 적용 안 함 — 병합 클러스터를 지우면 모서리를 못 쓴다.
+            edge = 'x_min' if branch_hint > 0 else 'x_max'
+            clusters = [c[edge] for c in raw if c['pixels'] >= cluster_min_pixels]
+            if not clusters:
+                bands.append({'valid': False, 'y': y_mid})
+                continue
             if running_line is None:
                 running_line = clusters[0] if branch_hint > 0 else clusters[-1]
             else:
                 nearest = min(clusters, key=lambda c: abs(c - running_line))
-                inner_jump = (
-                    (branch_hint > 0 and nearest > running_line + hug_track_tol) or
-                    (branch_hint < 0 and nearest < running_line - hug_track_tol))
-                if not inner_jump:
-                    running_line = nearest
+                # (A-3a) 방향 불문 |nearest − running_line| > tol이면 그 밴드는 갱신 안 하고
+                #   running_line 유지(라인이 사라지고 섬 V가 등장 → 마지막 위치로 coast).
+                if abs(nearest - running_line) <= hug_track_tol:
+                    # (A-3b) tol 이내 갱신은 raw 대입 대신 EMA로 흡수(모서리 지터 완화).
+                    running_line = ema_step(running_line, nearest, 0.5, hug_track_tol)
             if branch_hint > 0:
                 left_x = running_line
                 center = running_line + hug_bias
@@ -296,10 +314,12 @@ def fit_lane_line(ys, xs, weights, width):
     """
     ys = np.asarray(ys, dtype=np.float64)
     xs = np.asarray(xs, dtype=np.float64)
-    w = np.asarray(weights, dtype=np.float64)
-    if w.sum() <= 0:
-        w = np.ones_like(ys)
-    coeffs = np.polyfit(ys, xs, 1, w=w)
+    weights = np.asarray(weights, dtype=np.float64)
+    if weights.sum() <= 0:
+        weights = np.ones_like(ys)
+    # np.polyfit의 w는 '잔차에 곱해지는' 값이라 목적함수엔 w²로 들어간다. 픽셀수 비례
+    # 가중(의도)이 되려면 w=sqrt(픽셀수)를 넘겨야 실효 가중이 픽셀수에 비례한다.
+    coeffs = np.polyfit(ys, xs, 1, w=np.sqrt(weights))
     slope, intercept = float(coeffs[0]), float(coeffs[1])
     y_bottom = float(ys.max())
     y_top = float(ys.min())

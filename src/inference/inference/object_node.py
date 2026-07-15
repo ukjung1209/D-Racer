@@ -21,7 +21,6 @@ CLASS_COLORS = {
     'red': (0, 0, 255),
     'left': (255, 180, 0),
     'right': (0, 180, 255),
-    'obstacle': (255, 0, 255),   # 아루코 마커(동적 장애물)
 }
 
 
@@ -40,6 +39,9 @@ def get_default_model_path():
 
 class ObjectNode(Node):
     """카메라 이미지에서 신호등/표지판을 검출해 /object/detections로 발행한다.
+
+    이 노드는 YOLO 추론만 한다(아루코 검출은 하지 않는다 — 동적 장애물 마커는
+    decision_node가 6X6_50으로 직접 검출한다).
 
     Ultralytics YOLO26n(best_320.onnx)을 onnxruntime으로 추론한다. onnx는
     end2end로 export돼 NMS가 모델 안에 포함(출력 [1,300,6] = x1,y1,x2,y2,score,
@@ -90,27 +92,17 @@ class ObjectNode(Node):
         self._gamma_lut = None
         self._gamma_cached = None
 
-        # --- 아루코 마커(동적 장애물) 검출 ---
-        # enable_aruco=True면 매 프레임 아루코 마커도 찾아 같은 object/detections에
-        # class_name='obstacle'로 함께 발행한다(class_id=마커 ID, area_ratio=근접도).
-        # 기본은 꺼둬서(False) 신호등/갈림길 런치에는 영향이 없다.
-        self.declare_parameter('enable_aruco', False)
-        self.declare_parameter('aruco_dict', '4X4_50')   # cv2.aruco.DICT_<이 값>
-
         image_topic = str(self.get_parameter('image_topic').value)
         detection_topic = str(self.get_parameter('detection_topic').value)
         debug_topic = str(self.get_parameter('debug_topic').value)
         model_file = os.path.expanduser(str(self.get_parameter('model_file').value))
         self.publish_debug = bool(self.get_parameter('publish_debug').value)
         self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
-        self.enable_aruco = bool(self.get_parameter('enable_aruco').value)
 
         intra_threads = int(self.get_parameter('onnx_intra_threads').value)
         inter_threads = int(self.get_parameter('onnx_inter_threads').value)
         self.session, self.input_name, self.input_size = self._load_model(
             model_file, intra_threads, inter_threads)
-
-        self._init_aruco()
 
         # 밀린 프레임을 큐에 쌓지 않고 항상 최신 1장만 처리(실시간성 우선).
         # BEST_EFFORT 구독은 camera_node의 RELIABLE 발행과 호환된다(구독이 더 느슨).
@@ -129,56 +121,9 @@ class ObjectNode(Node):
             f'object_node started: image_topic={image_topic}, '
             f'detection_topic={detection_topic}, model={model_file}, '
             f'imgsz={self.input_size}, publish_debug={self.publish_debug}, '
-            f'enable_aruco={self.enable_aruco}, '
             f'onnx_threads=intra{intra_threads}/inter{inter_threads}, '
             f'process_every_n={int(self.get_parameter("process_every_n").value)}'
         )
-
-    # ------------------------------------------------------------------ #
-    #  아루코 검출기 준비 (opencv 버전별 API 차이 흡수)
-    # ------------------------------------------------------------------ #
-    def _init_aruco(self):
-        """enable_aruco면 아루코 딕셔너리/검출기를 만든다.
-
-        ⚠️ 이 보드의 시스템 cv2 4.5.4(apt)에 이미 cv2.aruco가 들어 있으니
-        pip로 opencv를 절대 깔지 마라(pip opencv는 GStreamer가 없어 camera_node가
-        죽는다 — d-racer-hardware-gotchas 참고). 4.5.4는 detectMarkers 함수형 API,
-        4.7+는 ArucoDetector 클래스라 둘 다 대응한다.
-        """
-        self.aruco_dict = None
-        self.aruco_params = None
-        self.aruco_detector = None
-        if not self.enable_aruco:
-            return
-        if not hasattr(cv2, 'aruco'):
-            self.get_logger().error(
-                'enable_aruco=True인데 cv2.aruco가 없다. 시스템 cv2(4.5.4)엔 있어야 정상 — '
-                'pip opencv가 시스템 걸 가리고 있는지 확인하라(pip opencv는 카메라를 죽인다). '
-                '아루코 검출 비활성화.')
-            self.enable_aruco = False
-            return
-
-        dict_name = str(self.get_parameter('aruco_dict').value)
-        dict_id = getattr(cv2.aruco, f'DICT_{dict_name}', None)
-        if dict_id is None:
-            self.get_logger().warning(
-                f'알 수 없는 aruco_dict={dict_name} → DICT_4X4_50 사용')
-            dict_id = cv2.aruco.DICT_4X4_50
-
-        if hasattr(cv2.aruco, 'getPredefinedDictionary'):
-            self.aruco_dict = cv2.aruco.getPredefinedDictionary(dict_id)
-        else:  # 아주 옛 버전
-            self.aruco_dict = cv2.aruco.Dictionary_get(dict_id)
-
-        try:
-            self.aruco_params = cv2.aruco.DetectorParameters()
-        except AttributeError:
-            self.aruco_params = cv2.aruco.DetectorParameters_create()
-
-        if hasattr(cv2.aruco, 'ArucoDetector'):  # opencv 4.7+
-            self.aruco_detector = cv2.aruco.ArucoDetector(
-                self.aruco_dict, self.aruco_params)
-        self.get_logger().info(f'aruco enabled: dict=DICT_{dict_name}')
 
     # ------------------------------------------------------------------ #
     #  onnx 모델 로딩: 입력 이름/해상도를 세션에서 자동으로 읽는다
@@ -200,7 +145,33 @@ class ObjectNode(Node):
         inp = session.get_inputs()[0]
         # 입력 shape [1, 3, H, W] → 정사각(H==W) 가정, 한 변을 imgsz로 쓴다
         input_size = int(inp.shape[2])
+
+        # end2end(NMS 내장) export인지 첫 출력 shape로 확인. rank 3 + 마지막 차원 6이
+        # 아니면 후처리 없는 _decode가 조용히 오작동하므로 기동 자체를 실패시킨다.
+        # 동적 차원(문자열/None)은 해당 축 검사를 건너뛴다(N은 보통 동적).
+        self._validate_output_shape(session)
         return session, inp.name, input_size
+
+    def _validate_output_shape(self, session):
+        """첫 출력이 end2end(NMS 포함) export의 [1, N, 6]인지 확인한다.
+
+        이 코드의 _decode는 NMS가 모델 안에 있다고 가정하고 score 필터링만 한다.
+        raw YOLO 출력([1, 84, N] 등)을 그대로 넣으면 좌표/클래스가 뒤섞여 조용히
+        오작동하므로, 여기서 기동을 실패시켜 잘못된 export를 즉시 드러낸다.
+        """
+        out = session.get_outputs()[0]
+        shape = list(out.shape)  # 예: [1, 300, 6]. 동적 축은 문자열/None.
+
+        def is_dynamic(dim):
+            return not isinstance(dim, int)
+
+        rank_ok = (len(shape) == 3)
+        last_ok = (rank_ok and (is_dynamic(shape[2]) or shape[2] == 6))
+        if not (rank_ok and last_ok):
+            raise RuntimeError(
+                f"object_node: 모델 출력 shape={shape}가 기대와 다르다 "
+                f"(기대: [1, N, 6] = x1,y1,x2,y2,score,class). end2end(NMS 포함) "
+                f"export가 아니다. Ultralytics export 시 nms=True로 다시 export하라.")
 
     # ------------------------------------------------------------------ #
     #  letterbox: 종횡비 유지한 채 imgsz 정사각으로 패딩. 역변환용 scale/pad 반환
@@ -287,40 +258,6 @@ class ObjectNode(Node):
         return detections
 
     # ------------------------------------------------------------------ #
-    #  아루코 마커 검출 → Detection(class_name='obstacle') 리스트
-    # ------------------------------------------------------------------ #
-    def _detect_aruco(self, frame, frame_w, frame_h):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if self.aruco_detector is not None:       # opencv 4.7+
-            corners, ids, _ = self.aruco_detector.detectMarkers(gray)
-        else:                                     # 함수형 API
-            corners, ids, _ = cv2.aruco.detectMarkers(
-                gray, self.aruco_dict, parameters=self.aruco_params)
-
-        detections = []
-        if ids is None:
-            return detections
-        frame_area = float(frame_w * frame_h)
-        for corner, marker_id in zip(corners, ids.flatten()):
-            pts = corner.reshape(-1, 2)
-            x1 = int(np.clip(pts[:, 0].min(), 0, frame_w - 1))
-            y1 = int(np.clip(pts[:, 1].min(), 0, frame_h - 1))
-            x2 = int(np.clip(pts[:, 0].max(), 0, frame_w - 1))
-            y2 = int(np.clip(pts[:, 1].max(), 0, frame_h - 1))
-            if x2 <= x1 or y2 <= y1:
-                continue
-            det = Detection()
-            det.class_name = 'obstacle'
-            det.class_id = int(marker_id)
-            det.confidence = 1.0              # 아루코는 검출 자체가 확정
-            det.xmin, det.ymin, det.xmax, det.ymax = x1, y1, x2, y2
-            # 마커의 실제 면적(회전 반영)을 area_ratio로 → 가까울수록 커짐
-            det.area_ratio = float(
-                cv2.contourArea(pts.astype(np.float32))) / frame_area
-            detections.append(det)
-        return detections
-
-    # ------------------------------------------------------------------ #
     def image_callback(self, msg: CompressedImage):
         # 처리율 제한: N프레임당 1장만 추론. 나머지는 디코딩·YOLO 전에 즉시 return.
         every_n = max(1, int(self.get_parameter('process_every_n').value))
@@ -345,9 +282,6 @@ class ObjectNode(Node):
         output = self.session.run(None, {self.input_name: tensor})[0]
         detections = self._decode(
             output, scale, pad_x, pad_y, frame_w, frame_h, conf_thr)
-
-        if self.enable_aruco:
-            detections.extend(self._detect_aruco(vis, frame_w, frame_h))
 
         msg_out = DetectionArray()
         msg_out.header.stamp = self.get_clock().now().to_msg()

@@ -94,7 +94,6 @@ class LaneNode(Node):
         self.declare_parameter('white_tophat_min', 18)          # top-hat 대비 하한 (글레어 남으면 ↑, 차선 끊기면 ↓)
         self.declare_parameter('roi_top_px', 45)                # -1이면 vehicle_config ROI_TOP
         self.declare_parameter('num_bands', 10)
-        self.declare_parameter('min_band_pixels', 12)
         self.declare_parameter('line_split_gap_px', 40)         # 좌/우 라인 분리 gap
         self.declare_parameter('lane_half_width_px', 90)        # 한쪽만 보일 때 반대편 추정
         # 클러스터 검증(mod 1): 배정 전 십자 가로획/잡음 조각을 거른다.
@@ -164,7 +163,7 @@ class LaneNode(Node):
         self.debug_bev_pub = self.create_publisher(CompressedImage, debug_bev_topic, 10)
         self.control_pub = self.create_publisher(Control, control_topic, 10)
 
-        self.prev_offset = 0.0
+        self.prev_offset = None   # None=D항 보호(첫 프레임/재획득). offset-0 가짜 킥 방지
         self.prev_center = None   # 직전 프레임 차선중심 (offset 시드 / cold-start 좌우판정)
         self.prev_left = None     # 직전 프레임 왼쪽 라인 x (per-line 연속 추적 앵커)
         self.prev_right = None    # 직전 프레임 오른쪽 라인 x
@@ -187,7 +186,15 @@ class LaneNode(Node):
     #  vehicle_config.yaml fallback 로딩
     # ------------------------------------------------------------------ #
     def branch_hint_callback(self, msg: Int8):
-        self.branch_hint = int(msg.data)
+        # (B-2) hugging 해제(비0 → 0) 순간 좌/우 앵커를 버린다. hugging 동안 동결됐던
+        # 낡은 앵커를 그대로 두면 해제 직후 게이트가 전부 기각돼 ~15프레임 검출 불능이
+        # 된다. None으로 비우면 다음 프레임 히스토그램 재획득(mod 4) 경로가 즉시 돈다.
+        new_hint = int(msg.data)
+        if self.branch_hint != 0 and new_hint == 0:
+            self.prev_left = None
+            self.prev_right = None
+            self.flip_count = 0
+        self.branch_hint = new_hint
 
     def _load_vehicle_config(self, path):
         if not os.path.exists(path):
@@ -275,11 +282,11 @@ class LaneNode(Node):
     # ------------------------------------------------------------------ #
     #  가로 밴드 분석 → lane_core 위임 (ROS 파라미터만 읽어 순수 함수로 넘김)
     # ------------------------------------------------------------------ #
-    def _analyze_bands(self, mask, width, num_bands, min_pixels, split_gap,
+    def _analyze_bands(self, mask, width, num_bands, split_gap,
                        half_width, seed_center, seed_left, seed_right,
                        branch_hint, hug_bias, hug_line_seed, hug_track_tol):
         return lane_core.analyze_bands(
-            mask, width, num_bands, min_pixels, split_gap,
+            mask, width, num_bands, split_gap,
             half_width, seed_center, seed_left, seed_right,
             branch_hint, hug_bias, hug_line_seed, hug_track_tol,
             int(self.get_parameter('cluster_max_width_px').value),
@@ -355,7 +362,6 @@ class LaneNode(Node):
         # --- 튜닝 파라미터 매 프레임 새로 읽기 (live 튜닝) ---
         lane_color = str(self.get_parameter('lane_color').value)
         num_bands = max(1, int(self.get_parameter('num_bands').value))
-        min_pixels = int(self.get_parameter('min_band_pixels').value)
         split_gap = int(self.get_parameter('line_split_gap_px').value)
         half_width = int(self.get_parameter('lane_half_width_px').value)
         hug_bias = int(self.get_parameter('hug_bias_px').value)
@@ -390,9 +396,18 @@ class LaneNode(Node):
                 self.prev_left, self.prev_right = peaks
 
         # hugging 중이면 직전 프레임 추종 라인을 시드로(연속 추적), 아니면 None(앵커 초기화)
-        hug_line_seed = self.prev_hug_line if self.branch_hint != 0 else None
+        # (B-1) hugging 첫 프레임(prev_hug_line=None)엔 최외곽 클러스터(반사광 위험) 대신
+        #   평시 앵커(좌-hug=prev_left / 우-hug=prev_right)를 시드로 넘긴다. 그 앵커도
+        #   None일 때만 seed=None으로 두어 lane_core의 최외곽 픽업을 폴백으로 쓴다.
+        if self.branch_hint != 0:
+            hug_line_seed = self.prev_hug_line
+            if hug_line_seed is None:
+                hug_line_seed = (self.prev_left if self.branch_hint > 0
+                                 else self.prev_right)
+        else:
+            hug_line_seed = None
         bands, hug_line = self._analyze_bands(
-            mask, width, num_bands, min_pixels, split_gap, half_width, seed_center,
+            mask, width, num_bands, split_gap, half_width, seed_center,
             self.prev_left, self.prev_right,
             self.branch_hint, hug_bias, hug_line_seed, hug_track_tol)
 
@@ -493,17 +508,22 @@ class LaneNode(Node):
         sign = float(self.get_parameter('steering_sign').value)
         throttle = float(self.get_parameter('test_throttle').value)
 
-        derivative = state.offset - self.prev_offset
-        self.prev_offset = state.offset
-
         control = Control()
         control.header.stamp = self.get_clock().now().to_msg()
         control.header.frame_id = 'lane_node'
         if state.detected:
+            # 재획득 첫 tick(prev_offset=None)엔 D항 0, 이후 정상 미분(offset-0 킥 방지).
+            if self.prev_offset is None:
+                derivative = 0.0
+            else:
+                derivative = state.offset - self.prev_offset
+            self.prev_offset = state.offset
             steer = sign * (kp * state.offset + kd * derivative) + trim
             control.steering = float(np.clip(steer, -1.0, 1.0))
             control.throttle = throttle
         else:
+            # 차선 상실 → prev_offset None으로 리셋(재획득 첫 tick D항 킥 방지).
+            self.prev_offset = None
             control.steering = float(np.clip(trim, -1.0, 1.0))
             control.throttle = 0.0
         self.control_pub.publish(control)
@@ -526,10 +546,10 @@ class LaneNode(Node):
 
         for b in bands:
             y = int(b['y'])
-            # (mod 6) 기각된 클러스터: 회색 X (십자 가로획/잡음 조각이 걸러졌음을 표시)
+            # (mod 6) 기각된 클러스터: 초록 X (십자 가로획/잡음 조각이 걸러졌음을 표시)
             for rx in b.get('rejected', []):
                 rx = int(rx)
-                cv2.drawMarker(img, (rx, y), (150, 150, 150),
+                cv2.drawMarker(img, (rx, y), (0, 255, 0),
                                cv2.MARKER_TILTED_CROSS, 8, 1)
             if not b['valid']:
                 continue
@@ -548,7 +568,8 @@ class LaneNode(Node):
                 ws = np.array([b.get('weight', 0) for b in valid], dtype=np.float64)
                 if ws.sum() <= 0:
                     ws = np.ones_like(ys)
-                slope, intercept = np.polyfit(ys, xs, 1, w=ws)
+                # fit_lane_line과 동일하게 sqrt 가중(polyfit w는 잔차에 곱해져 w²로 들어감).
+                slope, intercept = np.polyfit(ys, xs, 1, w=np.sqrt(ws))
                 y_lo, y_hi = 0, h - 1
                 p_lo = (int(slope * y_lo + intercept), y_lo)
                 p_hi = (int(slope * y_hi + intercept), y_hi)
