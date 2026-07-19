@@ -162,19 +162,64 @@ def pick_sign(detections, conf_min, area_min):
 
 
 # ------------------------------------------------------------------ #
-#  갈림길 표지판 방향 투표: 1프레임 오검출 래치 오발사 방지 (C-1)
+#  갈림길 표지판 방향 latch: 연속 투표로 곡선 오인식 래치 오발사 방지 (C-1)
 # ------------------------------------------------------------------ #
-def update_sign_vote(history, name, votes_needed=2, window=3):
-    """표지판 검출 1건(name='left'/'right')을 넣고 방향 확정 여부를 판정한다.
+def update_sign_latch(cur_dir, streak_dir, streak_count, observed, votes_needed):
+    """게이트(conf·area) 통과 표지판 관측 1건으로 latch 방향을 1스텝 갱신한다.
 
-    1프레임 즉시 래치는 표지판 1프레임 오검출로 hugging이 오발사된다. 최근 window회
-    검출 중 같은 클래스가 votes_needed회 이상일 때만 방향을 확정한다. 반대 클래스가
-    들어오면 히스토리를 비워(카운터 리셋) 흔들리는 검출로 잘못 확정되는 것을 막는다.
-    반환: (new_history, direction)  direction: +1=left, -1=right, 0=아직 미확정.
+    곡선을 화살표로 1~2프레임 오인식하면 즉시 래치돼 엉뚱한 hugging이 발동한다. 그래서
+    '같은 방향이 votes_needed회 연속'일 때만 방향을 바꾼다(진입도, 이미 latch된 상태에서
+    반대 방향으로의 변경도 동일하게 연속을 요구 → 1프레임 오인식으로 방향이 뒤집히지 않음).
+
+    observed: 'left' | 'right' | None. None(게이트 통과 표지판 없는 콜백)이면 연속이
+    끊긴 것이므로 streak을 리셋한다(스쳐가는 오인식은 연속을 못 채운다). cur_dir(현재 latch)는
+    유지 — 해제는 시간/red-zone 경로 소관이고 이 함수는 latch 확정에만 관여한다.
+
+    ※ streak 1스텝 = detection 콜백 1회. object_node가 process_every_n으로 10Hz 발행하므로
+      votes_needed=3은 약 0.3초다. process_every_n을 바꾸면 이 시간 의미가 변한다.
+
+    반환: (new_cur_dir, new_streak_dir, new_streak_count).
+      direction 부호: +1=left, -1=right, 0=미latch.
     """
-    if history and history[-1] != name:
-        history = []                       # 반대 클래스 → 리셋
-    history = (history + [name])[-window:]
-    if history.count(name) >= votes_needed:
-        return history, (1 if name == 'left' else -1)
-    return history, 0
+    if observed is None:
+        return cur_dir, 0, 0               # 연속 끊김 → streak 리셋(latch는 유지)
+    d = 1 if observed == 'left' else -1
+    if streak_dir == d:
+        streak_count += 1
+    else:
+        streak_dir = d                     # 반대/첫 관측 → 그 방향으로 1부터
+        streak_count = 1
+    if streak_count >= votes_needed and d != cur_dir:
+        cur_dir = d
+    return cur_dir, streak_dir, streak_count
+
+
+# ------------------------------------------------------------------ #
+#  갈림길 hugging 상태머신: 시작 → 유지(감속) → 종료 → 방향 남으면 재-hug(여러 번)
+# ------------------------------------------------------------------ #
+def hug_maneuver_step(is_hugging, elapsed, duration_sec,
+                      latched_dir, hug_done, sign_gone):
+    """continuous hugging + 지속시간 상한 상태머신 1스텝(시간 경과 계산은 노드).
+
+    표지판 방향이 확정되면(latched_dir≠0) hugging을 시작하고, 시작 duration_sec가 지나면
+    이번 hugging을 종료한다. '한 갈림길 1회' 제한은 없다 — 방향이 여전히 확정돼 있으면
+    (표지판이 계속 보이면) 종료 직후 다음 tick에 곧바로 다시 hugging을 시작해 여러 번
+    반복한다. 방향이 풀리면(latched_dir=0; 표지판 상실·빨강구간 해제는 노드 소관) IDLE로
+    대기한다. hug_done은 잠금에 더는 쓰이지 않고(항상 False) 인터페이스 호환 위해 남겨둔다.
+
+    반환: (action, hugging_active, new_hug_done).
+      action:
+        'START' : 이번 tick에 hugging 시작(노드가 시작시각 기록).
+        'HOLD'  : hugging 진행 중(노드가 hint=±1 발행 + 감속).
+        'END'   : duration 경과 → 이번 hugging 종료(노드가 hint=0). 방향이 남아 있으면 재-hug.
+        'IDLE'  : 방향 미확정 → 할 일 없음.
+      hugging_active: 이번 tick에 hugging을 유지하는가(hint·감속 게이트).
+      sign_gone: 더는 참조하지 않는다(재무장 잠금이 없어짐). 인자만 유지.
+    """
+    if is_hugging:
+        if elapsed >= duration_sec:
+            return 'END', False, False    # 종료 즉시 재무장 → 방향 남아 있으면 재-hug
+        return 'HOLD', True, hug_done
+    if latched_dir != 0:                   # (제거) hug_done 1회 잠금 없이 방향 확정되면 재-hug
+        return 'START', True, hug_done
+    return 'IDLE', False, hug_done

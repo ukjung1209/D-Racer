@@ -200,33 +200,89 @@ def test_pick_sign_selects_largest_area():
 
 
 # ================================================================== #
-#  표지판 방향 투표 (C-1): 1프레임 오검출 래치 방지
+#  표지판 방향 연속 투표 (수정 1): 곡선 오인식 래치 방지
 # ================================================================== #
-def test_sign_vote_needs_two_of_recent_to_latch():
-    """1프레임 검출로는 확정 안 되고, 같은 클래스 2회째에 방향 확정."""
-    hist = []
-    hist, d = decision_core.update_sign_vote(hist, 'left')
-    assert d == 0, '1프레임 즉시 래치됨'
-    hist, d = decision_core.update_sign_vote(hist, 'left')
-    assert d == 1, '2회째에 좌 확정 안 됨'
+def _latch_seq(observations, votes_needed=3, cur=0):
+    """관측 시퀀스를 update_sign_latch에 순차 투입, 최종 (cur_dir, streak_count) 반환."""
+    sd, sc = 0, 0
+    for obs in observations:
+        cur, sd, sc = decision_core.update_sign_latch(cur, sd, sc, obs, votes_needed)
+    return cur, sc
 
 
-def test_sign_vote_opposite_resets_counter():
-    """반대 클래스가 끼면 카운터 리셋 → 다시 2회 모여야 확정."""
-    hist = []
-    hist, d = decision_core.update_sign_vote(hist, 'left')
-    assert d == 0
-    # 반대(right)가 들어와 좌 카운터 리셋. right는 이제 1회 → 미확정.
-    hist, d = decision_core.update_sign_vote(hist, 'right')
-    assert d == 0
-    # right 2회째 → 우(-1) 확정.
-    hist, d = decision_core.update_sign_vote(hist, 'right')
-    assert d == -1
+def test_sign_latch_needs_three_consecutive():
+    """같은 방향 3연속에서만 latch. 2연속까지는 미latch."""
+    cur, _ = _latch_seq(['left', 'left'])
+    assert cur == 0, '2연속에 조기 latch'
+    cur, _ = _latch_seq(['left', 'left', 'left'])
+    assert cur == 1, '3연속인데 latch 안 됨'
 
 
-def test_sign_vote_flicker_never_latches():
-    """좌/우가 매 프레임 번갈아 흔들리면 어느 쪽도 확정되지 않는다."""
-    hist = []
-    for name in ('left', 'right', 'left', 'right', 'left'):
-        hist, d = decision_core.update_sign_vote(hist, name)
-        assert d == 0, f'흔들리는 검출인데 {name}에서 확정됨'
+def test_sign_latch_gap_resets_streak():
+    """2연속 + 공백(게이트 통과 없음=None) → streak 리셋되어 latch 안 됨."""
+    cur, cnt = _latch_seq(['left', 'left', None, 'left', 'left'])
+    assert cur == 0, '공백으로 연속이 끊겼는데 latch됨'
+    assert cnt == 2, 'streak가 공백 후 새로 카운트되지 않음'
+
+
+def test_sign_latch_opposite_switches_counter():
+    """반대 방향이 등장하면 카운터가 그 방향으로 1부터 전환."""
+    cur, sd, sc = 0, 1, 2                       # 좌 2연속 진행 중
+    cur, sd, sc = decision_core.update_sign_latch(cur, sd, sc, 'right', 3)
+    assert cur == 0 and sd == -1 and sc == 1, '반대 방향 카운터 전환 실패'
+
+
+def test_sign_latch_flip_requires_three_consecutive():
+    """이미 좌 latch된 상태에서 반대(우) 3연속이면 방향 변경, 2연속이면 유지."""
+    # 2연속 우 → 아직 좌 유지 (1프레임 오인식으로 뒤집히지 않음).
+    cur, _ = _latch_seq(['right', 'right'], cur=1)
+    assert cur == 1, '반대 2연속에 방향이 뒤집힘'
+    # 3연속 우 → 우로 변경.
+    cur, _ = _latch_seq(['right', 'right', 'right'], cur=1)
+    assert cur == -1, '반대 3연속인데 방향 변경 안 됨'
+
+
+def test_sign_latch_none_keeps_current_direction():
+    """게이트 통과 표지판 없는 콜백(None)은 latch 방향을 유지(해제는 시간/red-zone 담당)."""
+    cur, sd, sc = decision_core.update_sign_latch(1, 1, 5, None, 3)
+    assert cur == 1 and sd == 0 and sc == 0, 'None에서 latch가 풀리거나 streak가 안 리셋됨'
+
+
+# ================================================================== #
+#  hugging 지속시간 상한 상태머신 (수정 3+): 시작 → 종료 → 방향 남으면 재-hug
+# ================================================================== #
+def test_hug_maneuver_starts_on_latch():
+    """방향 확정(latched_dir≠0) + 안 도는 중 → START(hugging 활성)."""
+    action, active, done = decision_core.hug_maneuver_step(
+        is_hugging=False, elapsed=0.0, duration_sec=2.0,
+        latched_dir=1, hug_done=False, sign_gone=False)
+    assert action == 'START' and active is True and done is False
+
+
+def test_hug_maneuver_holds_then_ends_at_cap():
+    """진행 중 elapsed<2초 → HOLD(활성), elapsed≥2초 → END(비활성, 재무장 done=False)."""
+    a1, act1, d1 = decision_core.hug_maneuver_step(True, 1.9, 2.0, 1, False, False)
+    assert a1 == 'HOLD' and act1 is True and d1 is False
+    a2, act2, d2 = decision_core.hug_maneuver_step(True, 2.0, 2.0, 1, False, False)
+    assert a2 == 'END' and act2 is False and d2 is False
+
+
+def test_hug_maneuver_rehugs_while_direction_latched():
+    """once-per-fork 잠금 제거: 이전 hug_done 값과 무관하게 방향이 확정돼 있으면 재-hug(START)."""
+    action, active, done = decision_core.hug_maneuver_step(
+        False, 0.0, 2.0, latched_dir=1, hug_done=True, sign_gone=False)
+    assert action == 'START' and active is True
+    # sign_gone이 True여도(표지판 잠깐 놓쳐도) 방향이 남아 있으면 재-hug.
+    action2, active2, _ = decision_core.hug_maneuver_step(
+        False, 0.0, 2.0, latched_dir=-1, hug_done=True, sign_gone=True)
+    assert action2 == 'START' and active2 is True
+
+
+def test_hug_maneuver_idle_when_no_direction():
+    """방향 미확정(latched_dir=0)이면 할 일 없음(IDLE, 비활성) — hug_done 값 무관."""
+    action, active, _ = decision_core.hug_maneuver_step(
+        False, 0.0, 2.0, latched_dir=0, hug_done=False, sign_gone=False)
+    assert action == 'IDLE' and active is False
+    action2, active2, _ = decision_core.hug_maneuver_step(
+        False, 0.0, 2.0, latched_dir=0, hug_done=True, sign_gone=True)
+    assert action2 == 'IDLE' and active2 is False

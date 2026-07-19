@@ -136,6 +136,17 @@ class DecisionNode(Node):
         # --- 좌/우 갈림길 (단순화: 표지판 보이면 즉시 그 라인 hugging + 1회 stop-and-go) ---
         self.declare_parameter('sign_conf_min', 0.5)      # 표지판 최소 confidence
         self.declare_parameter('sign_area_min', 0.01)     # 이 크기 이상이어야 방향 인정(멀면 무시)
+        # (수정 1) 곡선 오인식 래치 방지: 게이트 통과 표지판이 같은 방향으로 이만큼 '연속'일
+        # 때만 latch. streak 1스텝 = detection 콜백 1회. object_node가 process_every_n(기본 3)으로
+        # 30fps→10Hz 발행하므로 3은 약 0.3초. process_every_n을 바꾸면 시간 의미가 변한다.
+        self.declare_parameter('sign_votes_needed', 3)
+        # (수정 3) hugging 지속시간 상한 + 감속: 방향 확정으로 hugging이 시작되면 그 순간부터
+        # 스로틀을 hug_speed_factor배로 감속하고, 시작 hug_duration_sec 뒤 hugging을 끝내
+        # 원래 속도·원래 차선주행으로 복귀한다.
+        self.declare_parameter('hug_speed_factor', 0.8)
+        self.declare_parameter('hug_duration_sec', 2.0)
+        # hugging 시작 직후 이 시간 동안 정지 후 출발. 지속시간 카운터는 이 pause 뒤부터.
+        self.declare_parameter('hug_pause_sec', 0.3)
         # (C-3) hugging 해제는 빨강 구간 진입(트랙 랜드마크)이 주 경로, 시간 해제는 폴백 →
         # 기본 4.0으로 늘려 갈림길 한복판에서 시간으로 조기 해제되는 것을 막는다.
         self.declare_parameter('hug_hold_sec', 4.0)       # 표지판 놓치고 이 시간 뒤 hugging 해제(폴백)
@@ -206,8 +217,14 @@ class DecisionNode(Node):
 
         # --- 갈림길 상태 (단순화) ---
         self.latched_dir = 0           # +1 = left, -1 = right, 0 = 평소 양쪽 추종
-        self.sign_history = []         # (C-1) 최근 표지판 방향 투표 히스토리(오래된 것부터)
+        # (수정 1) 연속 투표 상태: 게이트 통과 표지판이 같은 방향으로 연속된 스트릭.
+        self.sign_streak_dir = 0       # 현재 스트릭 방향(+1/-1/0)
+        self.sign_streak_count = 0     # 그 방향 연속 횟수
         self.last_sign_time = None     # 표지판을 마지막으로 본 시각
+        # (수정 3+) hugging 상태: 시작시각(None=미진행). hug_done은 once-per-fork 잠금이었으나
+        # 재-hug 허용으로 더는 잠그지 않는다(항상 False; 상태머신 인터페이스 호환 위해 유지).
+        self.hug_start_time = None
+        self.hug_done = False
         self.stop_start = None         # 정지 시작 시각, None=정지 안 함
         self.stopped_done = False      # 이번 갈림길 정지 완료 여부(1회)
 
@@ -338,7 +355,8 @@ class DecisionNode(Node):
                 self.last_sign_time = None
                 self.stopped_done = False
                 self.stop_start = None
-                self.sign_history = []
+                self.sign_streak_dir = 0
+                self.sign_streak_count = 0
         elif transition == 'APPROACH_TO_STOP':
             mid = max((b[4] for b in self.aruco_boxes), default=0.0)
             self.get_logger().info(
@@ -385,28 +403,34 @@ class DecisionNode(Node):
         return decision_core.pick_sign(dets, conf_min, area_min)
 
     def _update_sign_latch(self, msg: DetectionArray):
-        """표지판 방향을 투표로 확정해 그 방향으로 hugging을 시작한다.
+        """표지판 방향을 '연속 투표'로 확정해 그 방향으로 hugging을 시작한다.
 
-        (C-1) 1프레임 즉시 래치는 표지판 1프레임 오검출로 오발사된다. 최근 검출 투표
-        (update_sign_vote: 최근 3회 중 2회 이상 동일, 반대 클래스는 리셋)로 방향이
-        확정됐을 때만 latched_dir을 바꾼다. 확정 전(direction=0)이면 래치하지 않는다.
+        (수정 1) 곡선을 화살표로 1~2프레임 오인식하면 즉시 래치돼 오발사된다. 게이트 통과
+        표지판이 같은 방향으로 sign_votes_needed회 연속일 때만 latched_dir을 바꾼다. 게이트
+        통과 표지판이 없는 콜백은 연속을 끊어(streak 리셋) 스쳐가는 오인식이 연속을 못 채우게
+        한다. last_sign_time(해제 타이머용)은 게이트 통과 표지판을 본 시점에만 갱신 — 투표는
+        latch에만 관여한다. 이미 latch된 상태의 반대 방향 변경도 동일 연속을 요구한다.
         """
         best = self._pick_sign(msg)
-        if best is None:
+        observed = best[0] if best is not None else None    # 'left'/'right'/None
+        if best is not None:
+            self.last_sign_time = self.get_clock().now()
+        # hugging 진행 중(0.3초 정지 포함)엔 방향을 고정한다. 시작 때 확정한 그 차선을
+        # hug_duration 동안 유지하고, 도중에 새 표지판으로 다른 차선을 재latch하지 않는다.
+        # (last_sign_time은 위에서 갱신 → 해제 타이머는 정상. END 후에만 새 방향 확정 가능.)
+        if self.hug_start_time is not None:
             return
-        name, conf, area = best
-        self.last_sign_time = self.get_clock().now()
-        self.sign_history, direction = decision_core.update_sign_vote(
-            self.sign_history, name)
-        if direction == 0:
-            return
-        if direction != self.latched_dir:
-            was_cruise = (self.latched_dir == 0)
-            self.latched_dir = direction
-            if was_cruise:
+        prev_dir = self.latched_dir
+        (self.latched_dir, self.sign_streak_dir,
+         self.sign_streak_count) = decision_core.update_sign_latch(
+            self.latched_dir, self.sign_streak_dir, self.sign_streak_count,
+            observed, int(self.get_parameter('sign_votes_needed').value))
+        if self.latched_dir != prev_dir:
+            if prev_dir == 0:
                 self.stopped_done = False   # 새 갈림길 진입 → 정지 재무장
+            name, conf, area = best
             self.get_logger().info(
-                f'sign → hug {"LEFT" if direction == 1 else "RIGHT"} '
+                f'sign → hug {"LEFT" if self.latched_dir == 1 else "RIGHT"} '
                 f'(conf={conf:.2f}, area={area:.3f})')
 
     def _release_hug_if_sign_lost(self, p):
@@ -423,7 +447,8 @@ class DecisionNode(Node):
             self.last_sign_time = None
             self.stopped_done = False
             self.stop_start = None
-            self.sign_history = []
+            self.sign_streak_dir = 0
+            self.sign_streak_count = 0
 
     def _fork_stopping(self, p):
         """갈림길 stop-and-go: 표지판 hugging 중 + 두 차선 확실할 때 1회 정지.
@@ -682,6 +707,9 @@ class DecisionNode(Node):
             'throttle_accel_rate': float(self.get_parameter('throttle_accel_rate').value),
             'slow_factor': float(self.get_parameter('slow_factor').value),
             'hug_hold_sec': float(self.get_parameter('hug_hold_sec').value),
+            'hug_speed_factor': float(self.get_parameter('hug_speed_factor').value),
+            'hug_duration_sec': float(self.get_parameter('hug_duration_sec').value),
+            'hug_pause_sec': float(self.get_parameter('hug_pause_sec').value),
             'sign_stop_sec': float(self.get_parameter('sign_stop_sec').value),
             'stop_lane_conf_min': float(self.get_parameter('stop_lane_conf_min').value),
             'red_clear_time_sec': float(self.get_parameter('red_clear_time_sec').value),
@@ -694,8 +722,44 @@ class DecisionNode(Node):
         if p['enable_obstacle_mission']:
             self._update_obstacle_time(p)
 
-        # 갈림길 hugging 힌트: latched_dir(±1) → lane_node가 그 라인만 hugging (0=평소)
-        hint = self.latched_dir if p['enable_fork_mission'] else 0
+        # (수정 3+) hugging 지속시간 상한 상태머신. 시작 hug_duration_sec 뒤 종료해
+        # (latched_dir=0) 잠깐 원래 차선주행으로 돌아간다. '한 갈림길 1회' 잠금은 제거 —
+        # 표지판이 계속 보이면 종료 직후 방향이 재latch돼 곧바로 다시 hugging한다(여러 번 반복).
+        # 진짜 해제는 빨강 구간 진입(image_callback) 또는 표지판 hug_hold_sec 상실이 담당한다.
+        now = self.get_clock().now()
+        is_hugging = self.hug_start_time is not None
+        # hugging 시작 후 hug_pause_sec 동안은 '정지'(throttle 0), 지속시간 카운터는 그 이후부터.
+        # → 상태머신엔 (raw − pause)를 넘겨 END가 pause+duration에 걸리게 하고, pause 동안은 HOLD.
+        hug_raw_elapsed = ((now - self.hug_start_time).nanoseconds / 1e9) if is_hugging else 0.0
+        hug_elapsed = max(0.0, hug_raw_elapsed - p['hug_pause_sec'])
+        sign_gone = (self.last_sign_time is None or
+                     (now - self.last_sign_time).nanoseconds / 1e9 >= p['hug_hold_sec'])
+        hug_dir = self.latched_dir if p['enable_fork_mission'] else 0
+        action, hugging_active, self.hug_done = decision_core.hug_maneuver_step(
+            is_hugging, hug_elapsed, p['hug_duration_sec'],
+            hug_dir, self.hug_done, sign_gone)
+        if action == 'START':
+            self.hug_start_time = now
+            self.get_logger().info(
+                f'hug START → {p["hug_pause_sec"]:.1f}s stop, then '
+                f'{p["hug_speed_factor"]:.2f}x speed, {p["hug_duration_sec"]:.1f}s cap')
+        elif action == 'END':
+            self.hug_start_time = None
+            self.latched_dir = 0           # 지속시간 경과 → 이번 hugging 종료(방향 남아 있으면 재latch로 재-hug)
+            self.get_logger().info('hug END (duration cap) → cruise (방향 남아 있으면 재-hug)')
+
+        # hugging 시작 pause: 시작 후 hug_pause_sec 동안 정지(아래 throttle에서 0으로). START tick엔
+        # 바로 위에서 hug_start_time을 막 설정했으므로 여기서 다시 경과를 계산한다.
+        hug_pausing = False
+        if hugging_active and self.hug_start_time is not None:
+            since_start = (now - self.hug_start_time).nanoseconds / 1e9
+            hug_pausing = since_start < p['hug_pause_sec']
+
+        # 갈림길 hugging 힌트: hugging 활성 동안만 latched_dir(±1)을 lane_node에 알린다.
+        # 종료(END) 시 0을 발행해 lane_node가 웜스타트로 평상시 차선주행에 복귀한다.
+        # 조향은 조향각을 바로 트는 게 아니라, 아래 PD가 hugging 중점(offset/angle)을 따른다.
+        hug_factor = p['hug_speed_factor'] if hugging_active else 1.0
+        hint = self.latched_dir if hugging_active else 0
         self.branch_hint_pub.publish(Int8(data=int(hint)))
 
         trim = p['steer_trim']
@@ -722,8 +786,11 @@ class DecisionNode(Node):
 
         control.steering = float(clamp(pd_steer, -1.0, 1.0))
 
-        cruise = self._curve_throttle(p['base_throttle'], p)
+        # (수정 3) hugging 활성 동안 cruise를 hug_factor(0.8)배로 감속. 상한 종료 후엔 1.0.
+        cruise = self._curve_throttle(p['base_throttle'], p) * hug_factor
         target = self._arbitrate_throttle(cruise, self._fork_stopping(p), p)
+        if hug_pausing:
+            target = 0.0   # hugging 시작 직후 hug_pause_sec 동안 정지 후 출발
         if target <= 0.0:
             # 완전 정지(정지 미션). 재출발은 min_throttle부터 → 데드밴드 구간 안 지나감.
             control.throttle = 0.0

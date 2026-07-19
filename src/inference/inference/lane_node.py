@@ -1,28 +1,31 @@
 """차선 검출 노드 (회색 매트 + 흰색 사이드라인, OpenCV+numpy, 딥러닝 없음).
 
-파이프라인: ROI 크롭 → BEV 원근 → 흰색 마스크 → 가로 밴드별 좌/우 라인 분리 →
-차선 중심 → LaneState(offset/angle/confidence) 발행. 순수 밴드 분석은 lane_core.py에
+파이프라인: ROI 크롭 → BEV 원근 → 흰색 마스크 → (평소) 베이스 탐색 + 슬라이딩 윈도우
+체인 → 차선 중심 → LaneState(offset/angle/confidence) 발행. 순수 분석은 lane_core.py에
 있고(rclpy 없이 pytest 가능), 이 노드는 ROS 파라미터만 읽어 넘긴다.
 
-── 강건화 요약 (오검출/플립 방지) ──
-  1) 클러스터 검증 : 폭(cluster_max_width_px)·픽셀수(cluster_min_pixels)로 십자 가로획·
-                     잡음 조각을 배정 전에 제거. 앵커 게이트(anchor_gate_ratio)로 앵커에서
-                     너무 먼 클러스터는 배정 안 함. 역전/모호하면 밴드 무효(잘못 배정 금지).
-  2) 앵커 EMA     : 밴드/프레임 간 앵커를 raw가 아니라 EMA+이동량 상한으로 갱신
-                     (anchor_alpha_band/frame, anchor_max_step_band/frame_px) → 튐 방지.
-  3) 직선 피팅    : offset/angle을 유효 밴드 전체 가중(픽셀수) 1차 피팅으로. 부호는 기존과 동일.
-  4) 재획득       : 앵커 상실 시 히스토그램 두 피크(hist_width_tol)로 재획득, 한쪽만 보이면
-                     last_known_center 양가설(reacquire_margin)로 판정. 화면중심 폴백 제거.
+── 평소 경로(branch_hint==0) 요약 ──
+  1) 베이스 탐색  : 하단 1/3 히스토그램으로 좌/우 베이스 x를 프레임당 한 번 정한다(정체성
+                    판정). 피크 2개(간격 hist_width_tol) → 콜드스타트, 피크 1개 → 직전 베이스에
+                    base_match_tol_px 이내로 매칭. 앵커 경쟁·유령·유도 없음(좌/우 x 순서가 정체성).
+  2) 윈도우 체인  : 각 베이스에서 위로 num_bands개 윈도우(중심 ± window_margin_px)를 쌓아
+                    라인을 따라 올라간다. 빈 창 chain_max_gap 연속이면 종료. 체인은 자기 창만
+                    보므로 좌/우가 서로 먹는 게 구조적으로 불가능 → 플립 근절.
+  3) center·피팅  : 두 체인 점이면 중점, 한 점이면 그 점 ± half_est(실측 반폭). center 전체를
+                    가중(픽셀수) 1차 피팅해 offset/angle. angle 슬루(angle_max_delta) 유지.
+  4) coast        : 베이스 없음/유효 center<2면 직전 offset/angle을 coast_max_frames 동안 유지
+                    (detected=True, confidence 0.7^n 감쇠). 만료 시 정지(detected=False).
   5) 백분위 마스크: white V 하한을 프레임 상위 백분위(white_v_percentile)로 적응 → 밝은 매트 배제.
-  6) 디버그       : BEV에 기각 클러스터(회색 X)/앵커 세로선(좌파랑·우빨강)/피팅선(노랑)/state 표시.
-  ※ hugging(branch_hint±1) 경로는 1·2·3의 필터/게이트/EMA/피팅 대상에서 제외 — 동작 불변.
+  6) 디버그       : BEV에 베이스 삼각형(좌파랑·우빨강)/체인 점/center(노랑)/피팅선(노랑)/state 표시.
+  ※ hugging(branch_hint±1) 경로는 lane_core.analyze_bands가 담당 — 체인 도입 전과 동작 불변.
 
 ── 튜닝 가이드(전부 decision.yaml lane_node) ──
-  · 십자/무늬 오검출 → cluster_max_width_px ↓ (BEV 실측 차선폭의 ~2배로)
+  · 휜 라인 추종 느림 → window_margin_px ↑ (잡음 유입되면 ↓)
+  · 라인 끊겨 체인 종료 → chain_max_gap ↑
+  · 상실 후 너무 빨리 정지 → coast_max_frames ↑ (급발진 위험 시 ↓)
+  · 재획득 시 좌/우 흔들림 → base_match_tol_px ↓ 또는 hist_width_tol ↓
   · 잡음 오검출     → cluster_min_pixels ↑
-  · 좌/우 플립       → anchor_gate_ratio ↓(엄격) 또는 reacquire_margin ↑
-  · 커브 추종 느림   → anchor_alpha_band ↑ / anchor_max_step_band_px ↑
-  · 프레임 떨림      → anchor_alpha_frame ↓ / anchor_max_step_frame_px ↓
+  · 프레임 떨림      → angle_max_delta ↓
   · 글레어/밝은 매트 → white_v_percentile ↑ (또는 white_tophat_min ↑)
 """
 
@@ -94,32 +97,33 @@ class LaneNode(Node):
         self.declare_parameter('white_tophat_min', 18)          # top-hat 대비 하한 (글레어 남으면 ↑, 차선 끊기면 ↓)
         self.declare_parameter('roi_top_px', 45)                # -1이면 vehicle_config ROI_TOP
         self.declare_parameter('num_bands', 10)
-        self.declare_parameter('line_split_gap_px', 40)         # 좌/우 라인 분리 gap
-        self.declare_parameter('lane_half_width_px', 90)        # 한쪽만 보일 때 반대편 추정
-        # 클러스터 검증(mod 1): 배정 전 십자 가로획/잡음 조각을 거른다.
-        self.declare_parameter('cluster_max_width_px', 60)      # BEV 차선폭 ~2.5배. 넘으면 가로획으로 보고 버림
-        self.declare_parameter('cluster_min_pixels', 30)        # 실제 흰 픽셀 수 하한(잡음 조각 배제)
-        # 앵커 게이트: 최근접이라도 |cx−앵커| > half_width·gate_ratio면 배정 안 함(오배정 차단)
-        self.declare_parameter('anchor_gate_ratio', 0.4)
-        # 앵커 갱신 EMA(mod 2): 밴드 간은 크게(커브 추종), 프레임 간은 작게(안정).
-        self.declare_parameter('anchor_alpha_band', 0.6)        # 밴드 간 EMA 계수
-        self.declare_parameter('anchor_max_step_band_px', 25)   # 밴드 간 이동량 상한(px)
-        self.declare_parameter('anchor_alpha_frame', 0.35)      # 프레임 간 EMA 계수
-        self.declare_parameter('anchor_max_step_frame_px', 15)  # 프레임 간 이동량 상한(px)
+        self.declare_parameter('line_split_gap_px', 40)         # 클러스터 분리 gap (hugging이 사용)
+        self.declare_parameter('lane_half_width_px', 90)        # 한쪽 체인만 있을 때 반대편 추정(반폭 초기값)
+        # 클러스터 픽셀수 하한: hugging 후보 필터 + 체인 윈도우 점유 하한(min_band_pixels).
+        self.declare_parameter('cluster_min_pixels', 30)
+        # 클러스터 폭 상한(hugging 외 valid_clusters용). 십자 가로획 판별.
+        self.declare_parameter('cluster_max_width_px', 60)
         # 갈림길 hugging bias: 추종할 라인에서 이만큼만 안쪽으로 붙는다(작을수록 라인에 밀착)
         self.declare_parameter('hug_bias_px', 45)
         # hugging 중 추종 라인이 '안쪽(중앙)'으로 이 픽셀보다 확 튀면 = 라인 사라지고
         # 가운데 V(섬)가 등장한 것 → 그건 무시하고 마지막 위치로 coast(직진 유지).
         self.declare_parameter('hug_track_tol_px', 40)
-        # 차선을 잃어도 직전 좌/우 라인 앵커를 이만큼 프레임 유지.
-        # 짧은 dropout에선 방향 기억을 살려 재등장 시 좌/우 오분류를 막는다.
+        # 체인 상실 유예(coast 만료 전 유지 프레임). lost_hold_frames는 호환 위해 남겨둠.
         self.declare_parameter('lost_hold_frames', 15)
-        # 한쪽 라인만 보일 때 '반대편으로 넘어간' 판정(오배정 의심)이 이 프레임 수만큼
-        # 연속돼야 앵커를 뒤집는다. 순간 오검출 한두 프레임으로 좌/우가 뒤집히는 것 방지.
-        self.declare_parameter('flip_confirm_frames', 3)
-        # 재획득(mod 4): 앵커를 잃은 뒤 좌/우를 다시 잡는 판정 여유.
-        self.declare_parameter('hist_width_tol', 0.25)      # 히스토그램 두 피크 간격 허용오차(차선폭 대비)
-        self.declare_parameter('reacquire_margin', 0.3)     # 한쪽 라인 양가설 점수 차 하한(미만이면 판정 보류)
+        # 베이스 탐색: 하단 1/3 히스토그램 두 피크 간격 허용오차(차선폭 대비).
+        self.declare_parameter('hist_width_tol', 0.25)
+        self.declare_parameter('half_width_est_alpha', 0.2)  # 실측 반폭 EMA 계수
+        # 발행 angle 프레임당 최대 변화량(초과분 클램프). offset에는 미적용.
+        self.declare_parameter('angle_max_delta', 0.3)
+        # === 슬라이딩 윈도우 체인 신규 파라미터 (branch_hint==0) ===
+        # 윈도우 폭: 현재 중심 x ± 이 값. ↑=휜 라인 더 잘 따라가나 잡음 유입, ↓=엄격.
+        self.declare_parameter('window_margin_px', 40)
+        # 빈 창이 이만큼 연속이면 그 체인 종료(끊긴 라인 위로 무한 추정 방지).
+        self.declare_parameter('chain_max_gap', 2)
+        # coast: 베이스/center 상실 후 직전 방향을 유지하는 최대 프레임(초과 시 정지).
+        self.declare_parameter('coast_max_frames', 8)
+        # 베이스 1피크 매칭 허용치(px): 직전 베이스에서 이 안이면 그 side로 매칭.
+        self.declare_parameter('base_match_tol_px', 45)
 
         # --- 버드아이뷰(BEV) 원근변환: ROI 폭/높이 비율(0~1)로 사다리꼴 4점 지정 ---
         # 사다리꼴 양 옆변이 두 차선을 그대로 덮도록 맞춰야 BEV가 편다.
@@ -163,18 +167,24 @@ class LaneNode(Node):
         self.debug_bev_pub = self.create_publisher(CompressedImage, debug_bev_topic, 10)
         self.control_pub = self.create_publisher(Control, control_topic, 10)
 
-        self.prev_offset = None   # None=D항 보호(첫 프레임/재획득). offset-0 가짜 킥 방지
-        self.prev_center = None   # 직전 프레임 차선중심 (offset 시드 / cold-start 좌우판정)
-        self.prev_left = None     # 직전 프레임 왼쪽 라인 x (per-line 연속 추적 앵커)
-        self.prev_right = None    # 직전 프레임 오른쪽 라인 x
-        self.flip_count = 0       # 좌/우 반전 후보가 연속된 프레임 수 (히스테리시스)
+        self.prev_offset = None   # None=D항 보호(첫 프레임/재획득). offset-0 가짜 킥 방지 (PD용)
         self.prev_hug_line = None  # 직전 프레임에 hugging하던 라인 x (연속 추적 시드)
-        self.lost_count = 0       # 연속으로 차선을 잃은 프레임 수
-        # (mod 4) prior는 앵커를 버려도 절대 버리지 않는다 → 재획득 시 좌/우 방향 힌트.
-        self.last_known_center = None
-        self.last_known_left = None
-        self.last_known_right = None
-        self.track_state = 'FULL_SEARCH'   # FULL_SEARCH | TRACKING | COAST | REACQUIRE
+
+        # ── 체인 경로(branch_hint==0)의 프레임 간 상태: 이것이 전부다 ──
+        self.prev_base_left = None    # 직전 프레임 좌 베이스 x (1피크 매칭 기준)
+        self.prev_base_right = None   # 직전 프레임 우 베이스 x
+        # 실측 반폭 EMA(좌/우 체인 공존 윈도우에서 갱신). 초기값=lane_half_width_px.
+        self.half_est = float(self.get_parameter('lane_half_width_px').value)
+        self.coast_count = 0          # 연속 coast 프레임 수(0=정상). coast_max 초과 시 정지.
+        self.last_pub_offset = None   # coast 홀드용 직전 발행 offset/angle/confidence
+        self.last_pub_angle = None
+        self.last_pub_conf = 0.0
+        self.prev_pub_angle = None    # angle 슬루용 직전 발행 angle. 미검출/hugging 시 리셋.
+
+        self.track_state = 'LOST'     # TRACKING | COAST{n} | LOST
+        self._angle_slew_active = False  # (디버그) 이번 프레임 angle 슬루 발동 여부
+        self._dbg_base_left = None    # (디버그) 이번 프레임 베이스 마커 위치
+        self._dbg_base_right = None
 
         self.get_logger().info(
             f'lane_node started: image_topic={image_topic}, lane_topic={lane_topic}, '
@@ -186,14 +196,23 @@ class LaneNode(Node):
     #  vehicle_config.yaml fallback 로딩
     # ------------------------------------------------------------------ #
     def branch_hint_callback(self, msg: Int8):
-        # (B-2) hugging 해제(비0 → 0) 순간 좌/우 앵커를 버린다. hugging 동안 동결됐던
-        # 낡은 앵커를 그대로 두면 해제 직후 게이트가 전부 기각돼 ~15프레임 검출 불능이
-        # 된다. None으로 비우면 다음 프레임 히스토그램 재획득(mod 4) 경로가 즉시 돈다.
         new_hint = int(msg.data)
         if self.branch_hint != 0 and new_hint == 0:
-            self.prev_left = None
-            self.prev_right = None
-            self.flip_count = 0
+            # hugging 해제(비0 → 0): 웜스타트. 콜드스타트(피크 2개)를 기다리는 대신
+            # 추종하던 라인(prev_hug_line)으로 좌/우 베이스를 시드한다 — 갈림길 직후 두
+            # 차선이 아직 선명하지 않아도 1피크 매칭으로 즉시 추적을 잇는다. 실제 관측이
+            # 오면 실측으로 대체된다. 시드는 매칭 prior일 뿐이라 coast는 0에서 시작하고
+            # 직전 발행값은 비워(재획득 실패 시 stale 대신 정지) 안전하게 복귀한다.
+            self.prev_base_left, self.prev_base_right = lane_core.hug_warmstart_bases(
+                self.branch_hint, self.prev_hug_line, self.half_est)
+            self.coast_count = 0
+            self.last_pub_offset = None
+            self.last_pub_angle = None
+            self.last_pub_conf = 0.0
+            self.prev_pub_angle = None
+        elif self.branch_hint == 0 and new_hint != 0:
+            # hugging 진입(0 → 비0): coast 상태를 걷어낸다(hugging 중 coast 미발동 보장).
+            self.coast_count = 0
         self.branch_hint = new_hint
 
     def _load_vehicle_config(self, path):
@@ -280,76 +299,6 @@ class LaneNode(Node):
         return warped, src
 
     # ------------------------------------------------------------------ #
-    #  가로 밴드 분석 → lane_core 위임 (ROS 파라미터만 읽어 순수 함수로 넘김)
-    # ------------------------------------------------------------------ #
-    def _analyze_bands(self, mask, width, num_bands, split_gap,
-                       half_width, seed_center, seed_left, seed_right,
-                       branch_hint, hug_bias, hug_line_seed, hug_track_tol):
-        return lane_core.analyze_bands(
-            mask, width, num_bands, split_gap,
-            half_width, seed_center, seed_left, seed_right,
-            branch_hint, hug_bias, hug_line_seed, hug_track_tol,
-            int(self.get_parameter('cluster_max_width_px').value),
-            int(self.get_parameter('cluster_min_pixels').value),
-            float(self.get_parameter('anchor_gate_ratio').value),
-            float(self.get_parameter('anchor_alpha_band').value),
-            float(self.get_parameter('anchor_max_step_band_px').value),
-            self.last_known_center,
-            float(self.get_parameter('reacquire_margin').value))
-
-    # ------------------------------------------------------------------ #
-    #  프레임 간 좌/우 앵커 확정 (플립 히스테리시스)
-    # ------------------------------------------------------------------ #
-    def _commit_bottom_anchors(self, band, half_width, flip_confirm):
-        """가장 아래(가까운) 밴드로 다음 프레임의 좌/우 앵커를 갱신한다.
-
-        두 라인이 다 보이면 명확하니 바로 확정. 한쪽만 보일 때는 그 라인이 반대편
-        앵커를 침범(좌 라인인데 우 앵커보다 오른쪽 등)하면 오배정으로 의심해,
-        flip_confirm 프레임 연속으로 그럴 때만 앵커를 뒤집는다. 그 전까지는 이전
-        앵커를 유지해 순간 오검출로 좌/우가 뒤집히는 것을 막는다.
-
-        (mod 2) 확정 시 raw 대입이 아니라 프레임 간 EMA+이동량 상한(ema_step)으로
-        갱신한다. flip 히스테리시스는 유지하되 통과한 값을 EMA로 흡수한다.
-        """
-        alpha = float(self.get_parameter('anchor_alpha_frame').value)
-        max_step = float(self.get_parameter('anchor_max_step_frame_px').value)
-
-        def commit_left(x):
-            self.prev_left = lane_core.ema_step(self.prev_left, x, alpha, max_step)
-
-        def commit_right(x):
-            self.prev_right = lane_core.ema_step(self.prev_right, x, alpha, max_step)
-
-        nl, nr = band['left'], band['right']
-        if nl is not None and nr is not None:
-            commit_left(nl)
-            commit_right(nr)
-            self.flip_count = 0
-            return
-
-        min_gap = float(half_width)   # 두 라인 최소 간격 가정
-        if nl is not None:            # 왼쪽 라인만 봄
-            crossed = (self.prev_right is not None and nl > self.prev_right - min_gap)
-            if crossed:
-                self.flip_count += 1
-                if self.flip_count >= flip_confirm:
-                    commit_left(nl)
-                    self.flip_count = 0
-            else:
-                commit_left(nl)
-                self.flip_count = 0
-        elif nr is not None:          # 오른쪽 라인만 봄
-            crossed = (self.prev_left is not None and nr < self.prev_left + min_gap)
-            if crossed:
-                self.flip_count += 1
-                if self.flip_count >= flip_confirm:
-                    commit_right(nr)
-                    self.flip_count = 0
-            else:
-                commit_right(nr)
-                self.flip_count = 0
-
-    # ------------------------------------------------------------------ #
     def image_callback(self, msg: CompressedImage):
         raw = np.frombuffer(msg.data, dtype=np.uint8)
         frame = cv2.imdecode(raw, cv2.IMREAD_COLOR)
@@ -382,111 +331,129 @@ class LaneNode(Node):
             analysis_img, bev_src = roi, None
 
         mask = self._build_mask(analysis_img, lane_color)
-        seed_center = self.prev_center if self.prev_center is not None else width / 2.0
-
-        # (mod 4) 재획득: 앵커를 잃은(hold 초과) 상태로 이번 프레임에 진입했는지 기록.
-        # 평소(hugging 아님)에 앵커가 없으면 히스토그램 풀 서치로 두 라인을 다시 잡아
-        # 이번 프레임 시드로 넣는다. 실패하면 analyze_bands가 한쪽 라인 양가설로 시도한다.
-        anchors_missing = (self.branch_hint == 0
-                           and (self.prev_left is None or self.prev_right is None))
-        if anchors_missing:
-            peaks = lane_core.histogram_peaks(
-                mask, half_width, float(self.get_parameter('hist_width_tol').value))
-            if peaks is not None:
-                self.prev_left, self.prev_right = peaks
-
-        # hugging 중이면 직전 프레임 추종 라인을 시드로(연속 추적), 아니면 None(앵커 초기화)
-        # (B-1) hugging 첫 프레임(prev_hug_line=None)엔 최외곽 클러스터(반사광 위험) 대신
-        #   평시 앵커(좌-hug=prev_left / 우-hug=prev_right)를 시드로 넘긴다. 그 앵커도
-        #   None일 때만 seed=None으로 두어 lane_core의 최외곽 픽업을 폴백으로 쓴다.
-        if self.branch_hint != 0:
-            hug_line_seed = self.prev_hug_line
-            if hug_line_seed is None:
-                hug_line_seed = (self.prev_left if self.branch_hint > 0
-                                 else self.prev_right)
-        else:
-            hug_line_seed = None
-        bands, hug_line = self._analyze_bands(
-            mask, width, num_bands, split_gap, half_width, seed_center,
-            self.prev_left, self.prev_right,
-            self.branch_hint, hug_bias, hug_line_seed, hug_track_tol)
-
-        valid = [b for b in bands if b['valid']]
-
-        # 다음 프레임 시드: 가장 아래(가까운) 밴드로 좌/우 앵커를 갱신한다.
-        # 평소(hugging 아님)에만 플립 히스테리시스로 앵커를 확정한다. 차선을 잠깐
-        # 잃어도 앵커를 lost_hold_frames만큼 유지해야 재등장 시 좌/우가 안 뒤집힌다.
-        # (mod 4) 오래 잃으면(홀드 초과) 앵커는 버리되 last_known_*는 절대 버리지 않고,
-        # 다음 재등장 때 히스토그램/양가설 재획득의 방향 힌트로 쓴다(중앙 기준 폴백 제거).
-        if valid:
-            if self.branch_hint == 0:
-                self._commit_bottom_anchors(
-                    valid[0], half_width,
-                    int(self.get_parameter('flip_confirm_frames').value))
-            self.prev_center = valid[0]['center']
-            self.last_known_center = valid[0]['center']
-            if valid[0].get('left') is not None:
-                self.last_known_left = valid[0]['left']
-            if valid[0].get('right') is not None:
-                self.last_known_right = valid[0]['right']
-            self.lost_count = 0
-        else:
-            self.lost_count += 1
-            if self.lost_count > int(self.get_parameter('lost_hold_frames').value):
-                self.prev_center = None
-                self.prev_left = None
-                self.prev_right = None
-                self.flip_count = 0
-
-        # (mod 4) 트랙 상태 표시: 앵커 유무(진입 시점) × 이번 프레임 유효성으로 분류.
-        if self.branch_hint != 0:
-            self.track_state = 'TRACKING'          # hugging 중은 별도 추종
-        elif not anchors_missing:
-            self.track_state = 'TRACKING' if valid else 'COAST'
-        elif valid:
-            self.track_state = 'REACQUIRE'         # 앵커 없이 진입 → 이번에 재획득 성공
-        elif self.last_known_center is not None:
-            self.track_state = 'REACQUIRE'         # 재획득 시도 중(아직 실패)
-        else:
-            self.track_state = 'FULL_SEARCH'       # 진짜 cold start / prior 없음
-
-        # hugging 라인 연속 추적 시드: 마지막으로 알던 추종 라인 위치(사라짐 구간에도 유지).
-        # hugging 아니면 리셋해 다음 hugging 시작 때 최외곽 라인으로 재앵커.
-        self.prev_hug_line = hug_line if self.branch_hint != 0 else None
 
         state = LaneState()
         state.header.stamp = self.get_clock().now().to_msg()
         state.header.frame_id = 'camera'
+        cx = width / 2.0
+        self._angle_slew_active = False
+        self._dbg_base_left = None
+        self._dbg_base_right = None
 
-        if len(valid) >= 2:
-            cx = width / 2.0
-            near = valid[0]                 # 가장 아래(가까운) 밴드
-            far = valid[-1]                 # 가장 위(먼) 밴드
-            if self.branch_hint != 0:
-                # hugging: 동작 불변 위해 기존 2점(near/far) 차분 그대로.
-                offset = (near['center'] - cx) / (width / 2.0)
-                angle = (far['center'] - near['center']) / (width / 2.0)
+        if self.branch_hint != 0:
+            # ── hugging 경로 (지시 방향 최외곽 라인 추종, 체인 로직과 무관) ──
+            # hugging 첫 프레임(prev_hug_line=None)엔 최외곽 클러스터(반사광·잡음 위험)를
+            # 콜드픽업하는 대신, 진입 직전 cruise 베이스(그 방향 라인의 마지막 위치)를
+            # 시드로 넘긴다. 갈림길 진입에서 엉뚱한 바깥 조각을 잡는 것을 줄인다. 그 베이스도
+            # None이면 seed=None으로 두어 lane_core의 최외곽 픽업을 폴백으로 쓴다.
+            hug_seed = self.prev_hug_line
+            if hug_seed is None:
+                hug_seed = (self.prev_base_left if self.branch_hint > 0
+                            else self.prev_base_right)
+            bands, hug_line = lane_core.analyze_bands(
+                mask, width, num_bands, split_gap, half_width,
+                self.branch_hint, hug_bias, hug_seed, hug_track_tol,
+                int(self.get_parameter('cluster_min_pixels').value))
+            self.prev_hug_line = hug_line     # 사라짐 구간에도 마지막 위치 유지
+            self.coast_count = 0
+            self.prev_pub_angle = None         # hugging은 slew 미적용, 기억 리셋
+            self.track_state = 'TRACKING'
+            valid = [b for b in bands if b['valid']]
+            if len(valid) >= 2:
+                near, far = valid[0], valid[-1]
+                state.detected = True
+                state.offset = float(np.clip((near['center'] - cx) / cx, -1.0, 1.0))
+                state.angle = float(np.clip(
+                    (far['center'] - near['center']) / cx, -1.0, 1.0))
+                state.confidence = float(len(valid) / num_bands)
             else:
-                # (mod 3) 평소엔 유효 밴드 전체에 가중 직선 피팅(픽셀수 가중).
-                # 실패하면 기존 2점 차분으로 폴백.
-                try:
-                    ys = [b['y'] for b in valid]
-                    xs = [b['center'] for b in valid]
-                    ws = [b.get('weight', 0) for b in valid]
-                    offset, angle = lane_core.fit_lane_line(ys, xs, ws, width)
-                except Exception as exc:
-                    self.get_logger().warning(f'lane fit failed, 2점 차분 폴백: {exc}')
-                    offset = (near['center'] - cx) / (width / 2.0)
-                    angle = (far['center'] - near['center']) / (width / 2.0)
-            state.detected = True
-            state.offset = float(np.clip(offset, -1.0, 1.0))
-            state.angle = float(np.clip(angle, -1.0, 1.0))
-            state.confidence = float(len(valid) / num_bands)
+                state.detected = False
+                state.offset = 0.0
+                state.angle = 0.0
+                state.confidence = 0.0
         else:
-            state.detected = False
-            state.offset = 0.0
-            state.angle = 0.0
-            state.confidence = 0.0
+            # ── 평소 경로: 베이스 탐색 → 슬라이딩 윈도우 체인 → 피팅 → (상실 시) coast ──
+            self.prev_hug_line = None
+            base_left, base_right = lane_core.find_bases(
+                mask, self.half_est,
+                float(self.get_parameter('hist_width_tol').value),
+                self.prev_base_left, self.prev_base_right,
+                float(self.get_parameter('base_match_tol_px').value))
+            self._dbg_base_left = base_left
+            self._dbg_base_right = base_right
+
+            bands = []
+            centers = []
+            new_half = self.half_est
+            cbl = cbr = None
+            if base_left is not None or base_right is not None:
+                bands, centers, new_half, cbl, cbr = lane_core.analyze_chains(
+                    mask, width, num_bands, base_left, base_right,
+                    int(self.get_parameter('window_margin_px').value),
+                    int(self.get_parameter('cluster_min_pixels').value),
+                    int(self.get_parameter('chain_max_gap').value),
+                    self.half_est, float(half_width),
+                    float(self.get_parameter('half_width_est_alpha').value))
+
+            coast_max = int(self.get_parameter('coast_max_frames').value)
+            if len(centers) >= 2:
+                # 정상: 유효 밴드 center 전체에 가중 직선 피팅 → offset/angle.
+                ys = [c[0] for c in centers]
+                xs = [c[1] for c in centers]
+                ws = [c[2] for c in centers]
+                offset, angle = lane_core.fit_lane_line(ys, xs, ws, width)
+                offset = float(np.clip(offset, -1.0, 1.0))
+                angle = float(np.clip(angle, -1.0, 1.0))
+                # 발행 angle 변화율 제한(한 프레임 피팅선 폭주 흡수).
+                angle, self._angle_slew_active = lane_core.slew_limit(
+                    angle, self.prev_pub_angle,
+                    float(self.get_parameter('angle_max_delta').value))
+                confidence = float(len(centers) / num_bands)
+                # 프레임 간 상태 갱신: 베이스·반폭·직전 발행값. coast 리셋.
+                self.half_est = new_half
+                if cbl is not None:
+                    self.prev_base_left = cbl
+                if cbr is not None:
+                    self.prev_base_right = cbr
+                self.coast_count = 0
+                self.last_pub_offset = offset
+                self.last_pub_angle = angle
+                self.last_pub_conf = confidence
+                self.prev_pub_angle = angle
+                self.track_state = 'TRACKING'
+                state.detected = True
+                state.offset = offset
+                state.angle = angle
+                state.confidence = confidence
+            else:
+                # 베이스 없음 또는 유효 center < 2 → coast(추측 금지, confidence 감쇠).
+                self.coast_count += 1
+                det, off, ang, conf, expired = lane_core.coast_decision(
+                    self.coast_count, coast_max, self.last_pub_offset,
+                    self.last_pub_angle, self.last_pub_conf)
+                if expired:
+                    # coast 만료 → 정지 계약(detected=False). 상태 전면 리셋, 재획득은
+                    # 피크 2개 콜드스타트만 허용(직전 베이스 없어 1피크 매칭 자연 배제).
+                    self.coast_count = 0
+                    self.prev_base_left = None
+                    self.prev_base_right = None
+                    self.last_pub_offset = None
+                    self.last_pub_angle = None
+                    self.last_pub_conf = 0.0
+                    self.prev_pub_angle = None
+                    self.track_state = 'LOST'
+                    state.detected = False
+                    state.offset = 0.0
+                    state.angle = 0.0
+                    state.confidence = 0.0
+                else:
+                    # 직전 방향 유지(베이스·half_est 홀드). detected=True로 정지 방지.
+                    self.prev_pub_angle = ang
+                    self.track_state = 'COAST%d' % self.coast_count
+                    state.detected = det
+                    state.offset = off
+                    state.angle = ang
+                    state.confidence = conf
 
         self.publisher.publish(state)
 
@@ -529,37 +496,33 @@ class LaneNode(Node):
         self.control_pub.publish(control)
 
     # ------------------------------------------------------------------ #
-    #  검출점 그리기 (좌=파랑, 우=빨강, 중심=노랑) — analysis 이미지 좌표계
+    #  검출점 그리기 (좌 체인=파랑, 우 체인=빨강, 중심=노랑) — analysis 이미지 좌표계
     # ------------------------------------------------------------------ #
     def _draw_bands(self, img, bands):
         w = img.shape[1]
         h = img.shape[0]
         cv2.line(img, (w // 2, 0), (w // 2, h), (120, 120, 120), 1)
 
-        # (mod 6) 프레임 좌/우 앵커 짧은 세로선 (좌=파랑, 우=빨강) — 배정 기준 표시
-        if self.prev_left is not None:
-            x = int(self.prev_left)
-            cv2.line(img, (x, 0), (x, 12), (255, 0, 0), 1)
-        if self.prev_right is not None:
-            x = int(self.prev_right)
-            cv2.line(img, (x, 0), (x, 12), (0, 0, 255), 1)
+        # 이번 프레임 베이스 위치: 화면 하단에 좌=파랑/우=빨강 삼각형 마커.
+        def _base_marker(x, color):
+            if x is None:
+                return
+            cv2.drawMarker(img, (int(x), h - 5), color,
+                           cv2.MARKER_TRIANGLE_UP, 12, 2)
+        _base_marker(self._dbg_base_left, (255, 0, 0))
+        _base_marker(self._dbg_base_right, (0, 0, 255))
 
         for b in bands:
-            y = int(b['y'])
-            # (mod 6) 기각된 클러스터: 초록 X (십자 가로획/잡음 조각이 걸러졌음을 표시)
-            for rx in b.get('rejected', []):
-                rx = int(rx)
-                cv2.drawMarker(img, (rx, y), (0, 255, 0),
-                               cv2.MARKER_TILTED_CROSS, 8, 1)
             if not b['valid']:
                 continue
-            if b['left'] is not None:
+            y = int(b['y'])
+            if b.get('left') is not None:
                 cv2.circle(img, (int(b['left']), y), 3, (255, 0, 0), -1)    # 파랑
-            if b['right'] is not None:
+            if b.get('right') is not None:
                 cv2.circle(img, (int(b['right']), y), 3, (0, 0, 255), -1)   # 빨강
             cv2.circle(img, (int(b['center']), y), 3, (0, 255, 255), -1)    # 노랑
 
-        # (mod 6) 수정3 가중 피팅 직선을 노란 선으로 (유효 밴드 2개 이상)
+        # 가중 피팅 직선을 노란 선으로 (유효 밴드 2개 이상).
         valid = [b for b in bands if b['valid']]
         if len(valid) >= 2:
             try:
@@ -593,9 +556,18 @@ class LaneNode(Node):
     #  디버그 2장: raw(원본+사다리꼴) / bev(펼친 BEV+검출점) 별도 토픽 발행
     # ------------------------------------------------------------------ #
     def _publish_debug(self, roi, analysis_img, bev_src, bands, state, source_msg):
+        bl = f'{int(self._dbg_base_left)}' if self._dbg_base_left is not None else '-'
+        br = f'{int(self._dbg_base_right)}' if self._dbg_base_right is not None else '-'
+        # coast 중이면 잔여 프레임 수를 함께 표시.
+        coast_max = int(self.get_parameter('coast_max_frames').value)
+        state_str = self.track_state
+        if self.track_state.startswith('COAST'):
+            state_str = f'{self.track_state}(-{coast_max - self.coast_count})'
         text = (f"det={state.detected} off={state.offset:+.2f} "
                 f"ang={state.angle:+.2f} conf={state.confidence:.2f} "
-                f"hint={self.branch_hint:+d} state={self.track_state}")
+                f"hint={self.branch_hint:+d} state={state_str} "
+                f"hw={self.half_est:.0f} base=L{bl}/R{br}"
+                f"{' aSLEW' if self._angle_slew_active else ''}")
 
         # raw 패널: 원본 ROI + 사다리꼴(초록) + 상태 텍스트
         raw = roi.copy()

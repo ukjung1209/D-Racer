@@ -12,17 +12,17 @@
 decision_node:
   ros__parameters:
     # --- 차선추종 PD (주행마다 제일 자주 바뀌는 값) ---
-    steer_kp: 1.1
-    steer_kd: 0.55
-    steer_ka: 0.3
+    steer_kp: 0.7
+    steer_kd: 0.3
+    steer_ka: 0.0
     steering_sign: -1.0        # 반대로 꺾이면 1.0
-    base_throttle: 0.22
+    base_throttle: 0.26
     lane_timeout_sec: 0.5
 
     # --- 가변속도 (직선 빠르게 / 코너 미리 감속) ---
     speed_ka: 0.7               # |angle|(전방 곡률) 예측 감속. ↑=코너서 더 느리게
     speed_ko: 0.5               # |offset|(현재 이탈) 보정 감속
-    min_throttle: 0.17          # 감속 하한 (이보다 안 느려짐)
+    min_throttle: 0.21          # 감속 하한 (이보다 안 느려짐)
     throttle_accel_rate: 0.5    # 가속 슬루(초당 상한). ↓=더 완만하게 가속(튐 방지)
 
     # --- 미션 on/off (튜닝 땐 한 미션만 켜고 나머지 끔) ---
@@ -35,9 +35,13 @@ decision_node:
     green_votes_needed: 1       # 초록불 1프레임만 봐도 출발 (모델 신뢰도 낮아 즉시 반응)
     red_votes_needed_light: 1   # 빨간불 1프레임만 봐도 정지 (모델 신뢰도 낮아 즉시 반응)
 
-    # --- 좌/우 갈림길 (표지판 보이면 즉시 그 라인 hugging + 1회 stop-and-go) ---
+    # --- 좌/우 갈림길 (표지판 방향 확정 → 그 방향 라인 hugging, 중점을 PD로 자연 추종) ---
     sign_conf_min: 0.5
     sign_area_min: 0.01         # 이 크기 이상이어야 방향 인정 (너무 일찍 틀면 ↑)
+    sign_votes_needed: 2        # 같은 방향 연속 이 횟수(10Hz 기준 0.2초)여야 확정 (곡선 오인식 방지)
+    hug_speed_factor: 0.8       # hugging 중 스로틀 배수(0.8=20% 감속). min_throttle 하한은 유지됨
+    hug_duration_sec: 5.0       # hugging 시작 후 이 시간 지나면 종료 → 원래 속도·차선주행 복귀
+    hug_pause_sec: 0.3          # hugging 시작 직후 이 시간 정지 후 출발(카운터는 이 뒤부터)
     hug_hold_sec: 4.0           # 표지판 놓치고 이 시간 뒤 평소 복귀(폴백; 주 해제는 빨강 구간 진입)
     sign_stop_sec: 0.0          # 표지판 앞 정지 시간(stop-and-go), 0=끔(갈림길 정지 미사용)
     stop_lane_conf_min: 0.5     # 두 차선 이 conf 이상일 때만 정지
@@ -75,21 +79,20 @@ lane_node:
     roi_top_px: 45
     num_bands: 10
     line_split_gap_px: 40
-    lane_half_width_px: 135     # BEV 차선폭 반영 (기존 90보다 넓음)
-    # --- 클러스터 검증(mod 1): 십자 가로획/잡음 조각을 배정 전에 걸러냄 ---
-    cluster_max_width_px: 100   # 진단용 150에서 조인 확정값. 넘으면 가로획으로 보고 버림
-    cluster_min_pixels: 15      # 실제 흰 픽셀 수 하한 (잡음 조각 배제)
-    anchor_gate_ratio: 0.4      # |cx−앵커| > half_width·이 값 이면 배정 안 함 (오배정 차단)
-    # --- 앵커 갱신 EMA(mod 2): 밴드 간은 크게(커브 추종) / 프레임 간은 작게(안정) ---
-    anchor_alpha_band: 0.6      # 밴드 간 EMA 계수 (↑=커브 더 빨리 따라감)
-    anchor_max_step_band_px: 25 # 밴드 간 이동량 상한(px) — 한 스텝에 이보다 못 튐
-    anchor_alpha_frame: 0.35    # 프레임 간 EMA 계수 (↓=프레임 튐에 더 둔감)
-    anchor_max_step_frame_px: 15 # 프레임 간 이동량 상한(px)
-    flip_confirm_frames: 3      # 좌/우 반전을 확정하는 연속 프레임 수 (↑=더 끈질기게 유지)
-    # --- 재획득(mod 4): 앵커 잃은 뒤 좌/우 다시 잡기 ---
-    hist_width_tol: 0.25        # 히스토그램 두 피크 간격 허용오차(차선폭 대비). ↑=관대
-    reacquire_margin: 0.3       # 한쪽 라인 양가설 점수 차 하한 (미만이면 판정 보류)
-    hug_bias_px: 90             # 갈림길 hugging 시 라인에서 떨어지는 정도(BEV px)
+    lane_half_width_px: 135     # BEV 차선폭 반영 (한쪽 체인만 있을 때 반대편 추정, 반폭 초기값)
+    cluster_min_pixels: 15      # 흰 픽셀 수 하한 (hugging 후보 필터 + 체인 윈도우 점유 하한)
+    cluster_max_width_px: 100   # hugging 외 클러스터 폭 상한(십자 가로획 판별). 넘으면 버림
+    # --- 슬라이딩 윈도우 체인 (평소 경로) ---
+    window_margin_px: 40        # 윈도우 폭 ±. ↑=휜 라인 더 따라가나 잡음 유입, ↓=엄격
+    chain_max_gap: 2            # 빈 창 이만큼 연속이면 체인 종료(끊긴 라인 위로 추정 방지)
+    coast_max_frames: 8         # 상실 후 직전 방향 유지 최대 프레임(초과 시 정지). 급발진 위험 시 ↓
+    base_match_tol_px: 45       # 베이스 1피크 매칭 허용치(px). 직전 베이스에서 이 안이면 매칭
+    hist_width_tol: 0.25        # 베이스 두 피크 간격 허용오차(차선폭 대비). ↑=관대
+    half_width_est_alpha: 0.2   # 실측 반폭 EMA 계수
+    angle_max_delta: 0.3        # 발행 angle 프레임당 최대 변화량(피팅선 폭주 흡수)
+    hug_bias_px: 70             # 갈림길 hugging 시 라인에서 안쪽으로 떨어지는 정도(BEV px).
+                                # lane_half_width_px(135)면 차선 중앙=평소 추종과 동일. 작을수록
+                                # 추종 라인에 붙는다(더 붙이려면 ↓, 라인 밟으면 ↑).
     # --- BEV 사다리꼴 (트랙 실측 튜닝값) ---
     bev_top_left: 0.1
     bev_top_right: 0.9
@@ -106,4 +109,5 @@ object_node:
     conf_threshold: 0.35
     yolo_gamma: 0.4             # 노출 낮아 어두우면 ↓
     yolo_clahe: false
+    process_every_n: 1          # 매 프레임 추론(디버그 영상 부드럽게). ⚠️ YOLO가 코어 더 먹어 lane/control 끊길 수 있음
     publish_debug: true

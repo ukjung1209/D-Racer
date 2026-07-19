@@ -1,7 +1,8 @@
-"""lane_core 순수 함수 pytest (rclpy/inference_msgs 불필요).
+"""lane_core hugging(branch_hint != 0) 경로 pytest (rclpy/inference_msgs 불필요).
 
-합성 마스크로 밴드 분석·앵커·재획득 로직을 결정적으로 검증한다. ROS 없이 돌도록
-inference 패키지 경로만 잡고 lane_core를 직접 import 한다(패키지 __init__은 비어 있음).
+hugging은 슬라이딩 윈도우 체인 도입 후에도 동작 불변이다(분리섬 V자에 끌리지 않고
+바깥 차선 모서리 x_min/x_max를 추종). branch_hint==0 평소 경로는 체인 로직으로 교체돼
+test_lane_core_windows.py가 따로 검증한다(앵커/게이트/양가설/재획득 테스트는 함께 삭제).
 
 실행:  cd src/inference && python3 -m pytest test/test_lane_core.py -v
 """
@@ -23,100 +24,17 @@ SPLIT_GAP = 40
 HALF = 90
 MAX_WIDTH = 60
 MIN_CLUSTER_PIX = 30
-GATE_RATIO = 0.4
-
-
-def _analyze(mask, seed_left, seed_right, last_known_center=None,
-             cluster_min_pixels=MIN_CLUSTER_PIX):
-    """analyze_bands를 기본 파라미터로 호출하는 헬퍼(branch_hint=0, 평상 경로)."""
-    return lane_core.analyze_bands(
-        mask, W, NUM_BANDS, SPLIT_GAP, HALF,
-        seed_center=W / 2.0, seed_left=seed_left, seed_right=seed_right,
-        branch_hint=0, hug_bias=45, hug_line_seed=None, hug_track_tol=40,
-        cluster_max_width_px=MAX_WIDTH, cluster_min_pixels=cluster_min_pixels,
-        anchor_gate_ratio=GATE_RATIO,
-        anchor_alpha_band=1.0, anchor_max_step_band_px=1e9,
-        last_known_center=last_known_center, reacquire_margin=0.3)
-
-
-def _vertical_lines(x_left, x_right, thickness=4):
-    mask = np.zeros((H, W), np.uint8)
-    mask[:, x_left:x_left + thickness] = 255
-    mask[:, x_right:x_right + thickness] = 255
-    return mask
-
-
-# ------------------------------------------------------------------ #
-#  (a) 폭 100px 가로 띠(십자)가 섞여도 앵커가 오염되지 않음
-# ------------------------------------------------------------------ #
-def test_cross_bar_does_not_pollute_anchors():
-    # 두 세로 차선을 half_width(90)에 맞춰 배치: 좌=70, 우=250 → 중심 ~161.5, 반폭 90.
-    mask = _vertical_lines(70, 250)
-    # 한 밴드에 폭 90px 가로 띠(십자 가로획) 삽입 → cluster_max_width_px(60) 초과로 기각돼야.
-    mask[120:126, 116:206] = 255
-    bands, _ = _analyze(mask, seed_left=72.0, seed_right=252.0)
-    valid = [b for b in bands if b['valid']]
-    assert len(valid) >= 8, f'유효 밴드가 너무 적음: {len(valid)}'
-    centers = [b['center'] for b in valid]
-    # 가로획이 배정되면 center가 크게 흔들린다. 필터가 먹으면 전부 ~161 근처.
-    assert max(centers) - min(centers) < 10, f'center 오염: {centers}'
-    for b in valid:
-        assert 155 <= b['center'] <= 168, f'center 이탈: {b["center"]}'
-
-
-# ------------------------------------------------------------------ #
-#  (b) 게이트 밖 클러스터만 있는 밴드는 valid=False
-# ------------------------------------------------------------------ #
-def test_out_of_gate_cluster_yields_invalid_band():
-    # 라인 하나만 x=20에 있는데 앵커는 좌=200/우=290 → 게이트(90*0.4=36) 밖.
-    mask = np.zeros((H, W), np.uint8)
-    mask[:, 18:22] = 255
-    bands, _ = _analyze(mask, seed_left=200.0, seed_right=290.0)
-    valid = [b for b in bands if b['valid']]
-    assert valid == [], f'게이트 밖 클러스터가 배정됨: {valid}'
-
-
-# ------------------------------------------------------------------ #
-#  (c) 한쪽 선 + last_known_center prior로 양가설이 올바른 쪽 선택
-# ------------------------------------------------------------------ #
-def test_single_line_two_hypothesis_uses_prior():
-    # 세로 라인 하나만 x=120. 앵커는 없음(재획득 상황). prior에 따라 좌/우가 갈린다.
-    mask = np.zeros((H, W), np.uint8)
-    mask[:, 118:122] = 255
-
-    # prior가 오른쪽(240)이면: 이 선(120)은 '왼쪽 차선' → center=120+90=210이 prior에 더 가까움
-    bands_l, _ = _analyze(mask, seed_left=None, seed_right=None, last_known_center=240.0)
-    valid_l = [b for b in bands_l if b['valid']]
-    assert valid_l, 'prior=240에서 한쪽 라인 판정 실패'
-    assert valid_l[0]['left'] is not None and valid_l[0]['right'] is None
-    assert abs(valid_l[0]['center'] - 210.0) < 1.0
-
-    # prior가 왼쪽(30)이면: 이 선(120)은 '오른쪽 차선' → center=120-90=30이 prior와 일치
-    bands_r, _ = _analyze(mask, seed_left=None, seed_right=None, last_known_center=30.0)
-    valid_r = [b for b in bands_r if b['valid']]
-    assert valid_r, 'prior=30에서 한쪽 라인 판정 실패'
-    assert valid_r[0]['right'] is not None and valid_r[0]['left'] is None
-    assert abs(valid_r[0]['center'] - 30.0) < 1.0
-
-    # prior가 정확히 가운데(120)면 양가설 점수 차 < margin → 판정 보류(무효)
-    bands_amb, _ = _analyze(mask, seed_left=None, seed_right=None, last_known_center=120.0)
-    assert [b for b in bands_amb if b['valid']] == [], '모호한 prior인데 배정됨'
 
 
 # ================================================================== #
 #  hugging (A-1~A-3): 분리섬 V자에 끌리지 않고 바깥 차선 모서리 유지
 # ================================================================== #
 def _analyze_hug(mask, branch_hint, hug_line_seed):
-    """analyze_bands를 hugging 경로로 호출하는 헬퍼(seed_left/right는 hug에서 미사용)."""
+    """analyze_bands를 hugging 경로로 호출하는 헬퍼(신규 hugging-only 시그니처)."""
     return lane_core.analyze_bands(
         mask, W, NUM_BANDS, SPLIT_GAP, HALF,
-        seed_center=W / 2.0, seed_left=None, seed_right=None,
         branch_hint=branch_hint, hug_bias=45, hug_line_seed=hug_line_seed,
-        hug_track_tol=40,
-        cluster_max_width_px=MAX_WIDTH, cluster_min_pixels=MIN_CLUSTER_PIX,
-        anchor_gate_ratio=GATE_RATIO,
-        anchor_alpha_band=1.0, anchor_max_step_band_px=1e9,
-        last_known_center=None, reacquire_margin=0.3)
+        hug_track_tol=40, cluster_min_pixels=MIN_CLUSTER_PIX)
 
 
 def _fork_mask(lane_left_x=58, island_top_x=150, island_bottom_x=93,
@@ -199,26 +117,3 @@ def test_hug_ignores_out_of_tol_jump():
     _, hug_line = _analyze_hug(mask, branch_hint=1, hug_line_seed=58.0)
     # 위쪽 밴드엔 섬(180)만 있지만 |180-58|>40 → 갱신 무시, 추종선은 58 근처 유지.
     assert abs(hug_line - 58.0) <= 3.0, f'tol 밖 점프에 끌림: {hug_line}'
-
-
-# ================================================================== #
-#  B-2: hugging 해제(앵커 None) 후 히스토그램 재획득
-# ================================================================== #
-def test_reacquire_after_hug_release():
-    """hint 1→0 전환으로 앵커를 비운 다음 프레임, 히스토그램 재획득이 두 라인을
-    다시 잡아 정상 검출로 복귀한다. (동결된 낡은 앵커면 게이트에 전부 막히는 것도 확인.)"""
-    mask = _vertical_lines(70, 250)                 # 정상 두 라인(좌 70, 우 250)
-
-    # (1) hugging 동안 동결된 낡은 앵커(중앙 근처)면 실제 라인이 게이트 밖 → 검출 불능.
-    bands_stale, _ = _analyze(mask, seed_left=160.0, seed_right=200.0)
-    assert [b for b in bands_stale if b['valid']] == [], '낡은 앵커인데 검출됨'
-
-    # (2) B-2: 앵커를 None으로 리셋 → 노드가 histogram_peaks로 재획득해 시드로 넣는다.
-    peaks = lane_core.histogram_peaks(mask, HALF, 0.25)
-    assert peaks is not None, '히스토그램 재획득 실패'
-    left0, right0 = peaks
-    assert abs(left0 - 70.0) <= 6.0 and abs(right0 - 250.0) <= 6.0
-    bands_reacq, _ = _analyze(mask, seed_left=left0, seed_right=right0)
-    valid = [b for b in bands_reacq if b['valid']]
-    assert len(valid) >= 8, '재획득 후에도 검출 불능'
-    assert abs(valid[0]['center'] - 160.0) <= 12.0

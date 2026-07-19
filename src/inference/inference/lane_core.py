@@ -1,25 +1,33 @@
 """lane_node의 순수 차선-분석 로직 (ROS 의존 없음, numpy만).
 
-lane_node.py에서 분리한 이유: rclpy/inference_msgs 없이 pytest로 밴드 분석·앵커
+lane_node.py에서 분리한 이유: rclpy/inference_msgs 없이 pytest로 밴드 분석·체인
 로직을 직접 검증하기 위해서다. 여기 함수들은 상태를 self에 두지 않고 전부 인자로만
 받는 순수 함수라, 합성 마스크를 넣어 결정적으로 테스트할 수 있다.
 
-lane_node.py의 _analyze_bands는 이 모듈 함수를 얇게 감싸 ROS 파라미터만 읽어 넘긴다.
-알고리즘(밴드+앵커 구조, 갈림길 hugging)은 그대로 유지하고, 아래 강건화만 얹었다.
+── 구조 (branch_hint==0 = 평소 경로) ──
+  베이스 탐색(find_bases) → 하단에서 위로 슬라이딩 윈도우 체인(analyze_chains) →
+  밴드별 center → fit_lane_line(가중 1차 피팅) → offset/angle. 잃으면 coast_decision.
+
+  * 정체성(좌/우)은 프레임당 베이스 탐색에서 x 순서로 단 한 번 정해지고, 그 뒤엔
+    체인 소속으로 고정된다(밴드별 재판정·앵커 경쟁 없음 → 좌/우 플립 구조적 불가).
+  * 프레임 간 상태는 lane_node가 소유한다: prev_base_left/right, half_est, coast_count,
+    직전 발행 offset/angle(+슬루용 prev_pub_angle). core는 순수 함수.
+
+hugging(branch_hint != 0)은 analyze_bands가 그대로 담당한다(지시 방향 최외곽 라인
+하나 추종). 체인 로직 도입 전과 byte-identical.
 """
 
 import numpy as np
 
 
 # ------------------------------------------------------------------ #
-#  앵커 갱신: EMA + 이동량 상한
+#  앵커/추종선 갱신: EMA + 이동량 상한 (hugging이 사용)
 # ------------------------------------------------------------------ #
 def ema_step(anchor, meas, alpha, max_step):
-    """앵커를 meas 쪽으로 EMA 갱신하되 한 스텝 이동량을 max_step으로 제한.
+    """추종선을 meas 쪽으로 EMA 갱신하되 한 스텝 이동량을 max_step으로 제한.
 
-    커브에서 라인이 빠르게 움직여도 앵커가 한 번에 튀지 않게 하고(오검출 1회로 앵커가
-    날아가는 것 방지), 그러면서도 alpha만큼은 실제 관측을 따라가게 한다.
-    anchor가 None(첫 관측)이면 meas를 그대로 채택한다.
+    커브에서 라인이 빠르게 움직여도 한 번에 튀지 않게 하면서, alpha만큼은 실제 관측을
+    따라가게 한다. anchor가 None(첫 관측)이면 meas를 그대로 채택한다.
     """
     if anchor is None:
         return float(meas)
@@ -28,7 +36,7 @@ def ema_step(anchor, meas, alpha, max_step):
 
 
 # ------------------------------------------------------------------ #
-#  가로 밴드 → 라인 클러스터 추출
+#  가로 밴드 → 라인 클러스터 추출 (hugging이 사용)
 # ------------------------------------------------------------------ #
 def extract_clusters(band, split_gap):
     """가로 밴드(2D 마스크 슬라이스)를 split_gap 틈으로 나눠 라인 클러스터 목록 반환.
@@ -39,7 +47,7 @@ def extract_clusters(band, split_gap):
       'x_max'  : 마지막(최우) 열 x → 우-hug의 바깥 모서리
       'width'  : 열 폭(마지막 열 − 첫 열)  → 십자 가로획(넓음) 판별용
       'pixels' : 실제 흰 픽셀 수(열별 nonzero 합, '열 수'가 아님) → 잡음 조각 판별용
-    필터는 여기서 하지 않는다(hugging은 원본 클러스터가 필요) — 호출 측에서 거른다.
+    필터는 여기서 하지 않는다 — 호출 측에서 거른다.
     """
     col_counts = np.count_nonzero(band, axis=0)      # 열별 픽셀 수
     xs = np.nonzero(col_counts)[0]                    # 픽셀이 있는 열(오름차순)
@@ -68,39 +76,14 @@ def valid_clusters(clusters, max_width_px, min_pixels):
 
 
 # ------------------------------------------------------------------ #
-#  재획득 (mod 4): 앵커를 잃었을 때 좌/우를 다시 잡는다
+#  베이스 탐색: 하단 1/3 히스토그램으로 좌/우 베이스 x를 잡는다 (프레임당 한 번)
 # ------------------------------------------------------------------ #
-def pick_side_hypothesis(x, half_width, width, last_known_center, margin):
-    """한쪽 라인 x가 좌/우 어느 쪽인지 last_known_center prior로 판정.
-
-    가설 L: 이 선이 왼쪽 → 차선중심 = x + half_width
-    가설 R: 이 선이 오른쪽 → 차선중심 = x − half_width
-    점수 = 0.4·(중심이 [0,width] 안:1/0) + 0.6·exp(−|중심 − prior| / half_width)
-    두 가설 점수 차가 margin 이상일 때만 'left'/'right' 확정, 아니면 None(판정 보류).
-    prior가 없으면(진짜 cold start) 판정 불가 → None.
-    """
-    if last_known_center is None:
-        return None
-    half = max(1.0, float(half_width))
-    cl = x + half_width   # 가설 L의 차선중심
-    cr = x - half_width   # 가설 R의 차선중심
-
-    def score(c):
-        in_bounds = 1.0 if 0.0 <= c <= width else 0.0
-        return 0.4 * in_bounds + 0.6 * float(np.exp(-abs(c - last_known_center) / half))
-
-    sl, sr = score(cl), score(cr)
-    if abs(sl - sr) < margin:
-        return None
-    return 'left' if sl > sr else 'right'
-
-
 def histogram_peaks(mask, half_width, width_tol):
     """마스크 하단 1/3 열 히스토그램에서 두 라인 피크(좌, 우)를 추정한다.
 
     최대 피크 + 그로부터 half_width 이상 떨어진 차순위 피크를 잡고, 두 피크 간격이
     차선폭 가정 2·half_width·(1±width_tol) 안일 때만 (left, right)를 반환한다.
-    아니면 None(확정 보류) — 잘못된 앵커로 재출발하느니 한 프레임 더 기다린다.
+    아니면 None(확정 보류). find_bases의 두-피크 판정이 이 함수를 이용한다.
     """
     h = mask.shape[0]
     band = mask[(2 * h) // 3:, :]
@@ -124,48 +107,258 @@ def histogram_peaks(mask, half_width, width_tol):
     return None
 
 
+def find_bases(mask, half_est, width_tol, prev_left, prev_right, match_tol):
+    """하단 1/3 히스토그램으로 이 프레임 좌/우 베이스 x를 정한다(정체성 판정 지점).
+
+    반환: (base_left, base_right). 각 값은 float 또는 None.
+      · 피크 2개(간격 2·half_est·(1±width_tol) 이내) → 좌=작은 x, 우=큰 x. 콜드스타트 가능.
+      · 피크 1개뿐 → 직전 베이스(prev_left/prev_right) 중 match_tol 이내로 가까운 쪽에
+        매칭해 그 side 베이스로 삼는다. 둘 다 밖이거나 직전 베이스 없으면 → 그 side None.
+      · 피크 0개 → (None, None).
+    앵커 경쟁·유령·유도 없음. x 순서가 곧 정체성이다.
+    """
+    h = mask.shape[0]
+    band = mask[(2 * h) // 3:, :]
+    hist = np.count_nonzero(band, axis=0).astype(np.float64)
+    if hist.max() <= 0:
+        return None, None
+    p1 = int(np.argmax(hist))
+    masked = hist.copy()
+    lo = max(0, p1 - int(half_est))
+    hi = min(len(masked), p1 + int(half_est) + 1)
+    masked[lo:hi] = 0.0
+    if masked.max() > 0:
+        p2 = int(np.argmax(masked))
+        left, right = sorted((p1, p2))
+        gap = right - left
+        lo_gap = 2.0 * half_est * (1.0 - width_tol)
+        hi_gap = 2.0 * half_est * (1.0 + width_tol)
+        if lo_gap <= gap <= hi_gap:
+            return float(left), float(right)
+    # 단일(유효) 피크 → 직전 베이스에 매칭. 직전 베이스가 없으면 추측 금지.
+    dl = abs(p1 - prev_left) if prev_left is not None else float('inf')
+    dr = abs(p1 - prev_right) if prev_right is not None else float('inf')
+    if dl <= match_tol and dl <= dr:
+        return float(p1), None
+    if dr <= match_tol:
+        return None, float(p1)
+    return None, None
+
+
 # ------------------------------------------------------------------ #
-#  가로 밴드별로 좌/우 라인 분리 → 차선 중심 추정 (아래→위 전파)
+#  실측 반폭 half_est
 # ------------------------------------------------------------------ #
-def analyze_bands(mask, width, num_bands, split_gap,
-                  half_width, seed_center, seed_left, seed_right,
+def update_half_est(half_est, left_x, right_x, base_half, alpha):
+    """좌/우가 공존하는 윈도우의 실측 반폭 (right−left)/2로 half_est를 EMA 갱신.
+
+    항상 base_half(=lane_half_width_px)의 [0.7, 1.3] 범위로 클램프한다. 실측이 그
+    범위를 벗어나면 클램프 경계로 붙는다(엉뚱한 반폭으로 단측 center가 튀는 것 방지).
+    """
+    meas = (float(right_x) - float(left_x)) / 2.0
+    new = (1.0 - alpha) * float(half_est) + alpha * meas
+    lo = base_half * 0.7
+    hi = base_half * 1.3
+    return float(np.clip(new, lo, hi))
+
+
+# ------------------------------------------------------------------ #
+#  슬라이딩 윈도우 체인: 베이스에서 위로 라인을 따라 올라간다
+# ------------------------------------------------------------------ #
+def _slide_chain(mask, base_x, windows, margin, min_pixels, max_gap):
+    """base_x에서 위로 각 윈도우(현재 중심 ± margin)를 훑어 라인 점을 기록한다.
+
+    반환: {윈도우 인덱스 i: {'x': cx, 'pixels': n, 'y': y_mid}} — 점 잡힌 윈도우만.
+    창 안 흰 픽셀 ≥ min_pixels면 픽셀 평균 x로 재중심화하고 다음 창으로. 미만이면 빈 창.
+    빈 창이 max_gap 연속이면 체인 종료. 체인은 자기 창 안만 보므로 반대 라인·잡음은 무시.
+    """
+    pts = {}
+    cx = float(base_x)
+    w = mask.shape[1]
+    empty = 0
+    for i, (y0, y1, y_mid) in enumerate(windows):
+        x_lo = int(max(0, round(cx - margin)))
+        x_hi = int(min(w, round(cx + margin) + 1))
+        col_counts = (np.count_nonzero(mask[y0:y1, x_lo:x_hi], axis=0)
+                      if x_hi > x_lo else np.empty(0, int))
+        n = int(col_counts.sum())
+        if n >= min_pixels:
+            xs = np.nonzero(col_counts)[0]
+            cx = x_lo + float((xs * col_counts[xs]).sum() / col_counts[xs].sum())
+            pts[i] = {'x': cx, 'pixels': n, 'y': y_mid}
+            empty = 0
+        else:
+            empty += 1
+            if empty >= max_gap:
+                break
+    return pts
+
+
+def analyze_chains(mask, width, num_bands, base_left, base_right,
+                   window_margin, min_pixels, chain_max_gap,
+                   half_est, base_half, half_alpha, cross_guard=True):
+    """좌/우 베이스에서 슬라이딩 윈도우 체인을 쌓아 밴드별 차선 center를 만든다.
+
+    반환: (bands, centers, new_half_est, chain_base_left, chain_base_right).
+      · bands: 디버그용 밴드 목록(아래→위). 유효 밴드 = {'valid':True,'y','left','right',
+        'center','weight'}, 무효 = {'valid':False,'y','left':None,'right':None}.
+      · centers: [(y, center, weight)] — fit_lane_line 입력.
+      · new_half_est: 두 체인 공존 윈도우 실측으로 갱신·클램프한 반폭.
+      · chain_base_*: 각 체인의 최하단 재중심 x(다음 프레임 prev_base). 체인이 없으면
+        base_* 그대로(또는 None).
+
+    center 규칙(윈도우 인덱스별):
+      두 점 다 있으면 (l+r)/2, 한 점만 있으면 그 점 ± new_half_est(side는 체인 소속으로
+      고정 — 밴드별 재판정 없음), 둘 다 없으면 그 높이는 center 없음.
+    """
+    h = mask.shape[0]
+    band_h = max(1, h // num_bands)
+    windows = []
+    for i in range(num_bands):
+        y1 = h - i * band_h
+        y0 = max(0, y1 - band_h)
+        if y1 <= 0:
+            break
+        windows.append((y0, y1, (y0 + y1) // 2))
+
+    left_pts = (_slide_chain(mask, base_left, windows,
+                             window_margin, min_pixels, chain_max_gap)
+                if base_left is not None else {})
+    right_pts = (_slide_chain(mask, base_right, windows,
+                              window_margin, min_pixels, chain_max_gap)
+                 if base_right is not None else {})
+
+    # (안전핀) 같은 높이에서 좌 체인 중심 ≥ 우 체인 중심으로 교차하면 그 높이 이후 종료.
+    if cross_guard and left_pts and right_pts:
+        cut = None
+        for i in range(len(windows)):
+            lp, rp = left_pts.get(i), right_pts.get(i)
+            if lp is not None and rp is not None and lp['x'] >= rp['x']:
+                cut = i
+                break
+        if cut is not None:
+            left_pts = {i: p for i, p in left_pts.items() if i < cut}
+            right_pts = {i: p for i, p in right_pts.items() if i < cut}
+
+    # half_est: 두 체인 공존 윈도우의 실측 반폭으로 갱신(단측 center에 쓰기 전에 확정).
+    new_half = float(half_est)
+    for i in range(len(windows)):
+        lp, rp = left_pts.get(i), right_pts.get(i)
+        if lp is not None and rp is not None:
+            new_half = update_half_est(new_half, lp['x'], rp['x'], base_half, half_alpha)
+
+    bands = []
+    centers = []
+    for i, (y0, y1, y_mid) in enumerate(windows):
+        lp, rp = left_pts.get(i), right_pts.get(i)
+        lx = lp['x'] if lp is not None else None
+        rx = rp['x'] if rp is not None else None
+        if lx is not None and rx is not None:
+            center = (lx + rx) / 2.0
+            weight = lp['pixels'] + rp['pixels']
+        elif lx is not None:
+            center = lx + new_half
+            weight = lp['pixels']
+        elif rx is not None:
+            center = rx - new_half
+            weight = rp['pixels']
+        else:
+            bands.append({'valid': False, 'y': y_mid, 'left': None, 'right': None})
+            continue
+        center = float(np.clip(center, 0.0, width))
+        bands.append({'valid': True, 'y': y_mid, 'left': lx, 'right': rx,
+                      'center': center, 'weight': weight})
+        centers.append((y_mid, center, weight))
+
+    chain_base_left = (left_pts[0]['x'] if 0 in left_pts
+                       else (float(base_left) if base_left is not None else None))
+    chain_base_right = (right_pts[0]['x'] if 0 in right_pts
+                        else (float(base_right) if base_right is not None else None))
+    return bands, centers, new_half, chain_base_left, chain_base_right
+
+
+# ------------------------------------------------------------------ #
+#  coast: 잃으면 가던 방향 유지, 추측 금지 (무한 coast·급발진 방지)
+# ------------------------------------------------------------------ #
+def coast_decision(coast_count, coast_max, last_offset, last_angle, last_conf):
+    """베이스 없음/유효 center<2인 프레임의 발행값을 정한다(순수 함수).
+
+    coast_count는 이번 프레임 포함 누적(1,2,…). 반환:
+      (detected, offset, angle, confidence, expired).
+      · coast_count ≤ coast_max 이고 직전 발행값이 있으면: 직전 offset/angle 그대로,
+        detected=True, confidence = last_conf × 0.7^coast_count (감쇠), expired=False.
+      · coast_max 초과(또는 직전 발행값 없음): detected=False, 0/0/0, expired=True →
+        호출측이 coast·베이스·직전값을 리셋하고 정지(decision 계약)로 넘어간다.
+    """
+    if coast_count <= coast_max and last_offset is not None:
+        conf = float(last_conf) * (0.7 ** coast_count)
+        return True, float(last_offset), float(last_angle), float(conf), False
+    return False, 0.0, 0.0, 0.0, True
+
+
+# ------------------------------------------------------------------ #
+#  hugging 종료 웜스타트: 추종하던 라인으로 다음 프레임 베이스를 시드한다
+# ------------------------------------------------------------------ #
+def hug_warmstart_bases(branch_hint, hug_line, half_est):
+    """hugging 해제 첫 프레임의 좌/우 베이스 시드(prior)를 만든다.
+
+    hugging은 어느 쪽 라인을 따라가고 있었는지 안다 — 이것이 강점이다. 콜드스타트(피크
+    2개)를 기다리는 대신 그 라인 위치를 베이스로 시드하면, 갈림길 직후 두 차선이 아직
+    선명하지 않아도 1피크 매칭으로 즉시 추적을 잇는다. 실제 관측이 오면 실측으로 대체된다.
+
+    반환: (base_left, base_right).
+      · branch_hint > 0 (좌 라인 hugging): 좌=hug_line, 우=hug_line + 2×half_est.
+      · branch_hint < 0 (우 라인 hugging): 우=hug_line, 좌=hug_line − 2×half_est.
+      · hug_line이 None이면 시드 없음 (None, None) → 콜드스타트로 폴백.
+    """
+    if hug_line is None:
+        return None, None
+    if branch_hint > 0:
+        return float(hug_line), float(hug_line) + 2.0 * float(half_est)
+    return float(hug_line) - 2.0 * float(half_est), float(hug_line)
+
+
+# ------------------------------------------------------------------ #
+#  발행 변화율 제한(angle 슬루)
+# ------------------------------------------------------------------ #
+def slew_limit(value, prev, max_delta):
+    """발행 변화율 제한: |value − prev| > max_delta면 prev ± max_delta로 클램프.
+
+    반환: (limited_value, was_limited). prev가 None(첫 발행/재획득)이면 그대로 통과.
+    한 프레임 피팅선이 눕는 angle 폭주를 흡수해 조향 튐을 막는다.
+    """
+    if prev is None:
+        return float(value), False
+    lo, hi = prev - max_delta, prev + max_delta
+    if value < lo:
+        return float(lo), True
+    if value > hi:
+        return float(hi), True
+    return float(value), False
+
+
+# ------------------------------------------------------------------ #
+#  hugging (branch_hint != 0): 지시 방향 최외곽 라인 하나 추종 (byte-identical)
+# ------------------------------------------------------------------ #
+def analyze_bands(mask, width, num_bands, split_gap, half_width,
                   branch_hint, hug_bias, hug_line_seed, hug_track_tol,
-                  cluster_max_width_px, cluster_min_pixels, anchor_gate_ratio,
-                  anchor_alpha_band=1.0, anchor_max_step_band_px=1e9,
-                  last_known_center=None, reacquire_margin=0.3):
-    """밴드마다 좌/우 라인을 나눠 차선 중심을 잡는다. (mask/width는 분석영상 좌표계)
+                  cluster_min_pixels):
+    """hugging 전용 밴드 분석. branch_hint>0=좌 라인, <0=우 라인을 밴드마다 추종한다.
 
-    per-line 앵커(seed_left/seed_right)는 직전 프레임의 좌/우 라인 x다. 한쪽 라인만
-    보여도 '중심 대비 좌/우'가 아니라 '어느 앵커에 더 가까운가'로 판정하므로, 커브에서
-    라인이 화면중앙을 넘어와도 같은 라인으로 계속 인식된다.
+    (A-2) 대표값을 cx가 아니라 '바깥 모서리'로 잡는다: 좌-hug(>0)는 x_min, 우-hug(<0)는
+      x_max. 분리섬 V자 빗변과 병합돼 뚱뚱해진 클러스터라도 바깥 모서리는 진짜 차선 위에
+      남으므로 cx처럼 안쪽으로 끌려가지 않는다.
+    (A-3c) 픽셀 적은 잡음/반사 조각은 후보에서 제외한다. 폭 필터는 적용 안 함(병합 클러스터를
+      지우면 모서리를 못 쓴다).
+    (A-3a) |nearest − running_line| > tol이면 그 밴드는 갱신 안 하고 running_line 유지
+      (라인이 사라지고 섬 V가 등장 → 마지막 위치로 coast). (A-3b) tol 이내 갱신은 raw 대입
+      대신 EMA로 흡수(모서리 지터 완화).
 
-    강건화(mod 1):
-      · 클러스터 폭/픽셀수 필터로 십자 가로획·잡음 조각을 배정 전에 걸러낸다.
-      · 앵커 게이트: 최근접이라도 |cx − anchor| > half_width·gate_ratio면 배정 안 함.
-      · 좌/우가 같은 클러스터거나 left ≥ right 역전이면 '최대 틈 분리 폴백'(오염 통로)
-        대신 그 밴드를 무효 처리한다. "잘못 배정하느니 밴드를 버린다."
-    강건화(mod 2):
-      · 밴드 간 앵커 전파를 raw 대입이 아니라 EMA+이동량 상한(ema_step)으로 한다.
-        오검출 1회로 앵커가 튀지 않으면서 커브는 alpha만큼 따라간다.
-    강건화(mod 4):
-      · 앵커 없이 한 줄만 보이는 밴드는 '화면 중심 기준' 폴백(플립 원인)을 버리고,
-        last_known_center prior로 양가설(이 선이 좌? 우?)을 판정한다. 확신이 없으면
-        (점수 차 < reacquire_margin) 그 밴드를 무효 처리한다(판정 보류).
-    hugging(branch_hint != 0) 경로(A-2/A-3, 분리섬 오염 방지):
-      · 클러스터 대표값을 cx가 아니라 바깥 모서리(좌-hug x_min / 우-hug x_max)로 잡아
-        분리섬 V자와 병합돼도 cx처럼 안쪽으로 끌려가지 않게 한다.
-      · running_line 갱신은 |nearest − running_line| ≤ hug_track_tol일 때만(방향 불문),
-        그것도 raw 대입이 아니라 ema_step으로 흡수. 픽셀수 하한은 적용, 폭 필터는 미적용.
-      · 평시 게이트/역전 폴백/양가설(mod 1·4)은 hugging에 관여하지 않는다.
+    이 함수는 체인 로직(branch_hint==0)과 무관하게 도입 전과 동일 출력을 낸다.
     """
     h = mask.shape[0]
     band_h = max(1, h // num_bands)
     bands = []
-    running_left = seed_left
-    running_right = seed_right
     running_line = hug_line_seed     # hugging 중 추종하는 라인 x (밴드 아래→위 연속)
-    gate = half_width * anchor_gate_ratio
-    _ = seed_center                  # (mod 4) 화면중심 폴백 삭제로 미사용 — 시그니처만 유지
 
     for i in range(num_bands):
         y1 = h - i * band_h
@@ -180,128 +373,37 @@ def analyze_bands(mask, width, num_bands, split_gap,
             continue
 
         left_x = right_x = None
-        weight = 0
-        rejected = []          # (mod 6) 필터에 걸린 클러스터 cx (디버그 회색 X)
 
-        if branch_hint != 0:
-            # ── hugging: 지시 방향 최외곽 라인 하나만 추종 ──
-            # (A-2) 대표값을 cx가 아니라 '바깥 모서리'로 잡는다: 좌-hug(>0)는 x_min,
-            #   우-hug(<0)는 x_max. 분리섬 V자 빗변과 병합돼 뚱뚱해진 클러스터라도 바깥
-            #   모서리는 진짜 차선 위에 남으므로 cx처럼 안쪽으로 끌려가지 않는다.
-            # (A-3c) 픽셀 적은 잡음/반사 조각은 후보에서 제외한다. 단 폭 필터
-            #   (cluster_max_width_px)는 적용 안 함 — 병합 클러스터를 지우면 모서리를 못 쓴다.
-            edge = 'x_min' if branch_hint > 0 else 'x_max'
-            clusters = [c[edge] for c in raw if c['pixels'] >= cluster_min_pixels]
-            if not clusters:
-                bands.append({'valid': False, 'y': y_mid})
-                continue
-            if running_line is None:
-                running_line = clusters[0] if branch_hint > 0 else clusters[-1]
-            else:
-                nearest = min(clusters, key=lambda c: abs(c - running_line))
-                # (A-3a) 방향 불문 |nearest − running_line| > tol이면 그 밴드는 갱신 안 하고
-                #   running_line 유지(라인이 사라지고 섬 V가 등장 → 마지막 위치로 coast).
-                if abs(nearest - running_line) <= hug_track_tol:
-                    # (A-3b) tol 이내 갱신은 raw 대입 대신 EMA로 흡수(모서리 지터 완화).
-                    running_line = ema_step(running_line, nearest, 0.5, hug_track_tol)
-            if branch_hint > 0:
-                left_x = running_line
-                center = running_line + hug_bias
-            else:
-                right_x = running_line
-                center = running_line - hug_bias
+        edge = 'x_min' if branch_hint > 0 else 'x_max'
+        clusters = [c[edge] for c in raw if c['pixels'] >= cluster_min_pixels]
+        if not clusters:
+            bands.append({'valid': False, 'y': y_mid})
+            continue
+        if running_line is None:
+            running_line = clusters[0] if branch_hint > 0 else clusters[-1]
         else:
-            # ── 평소: 필터 통과 클러스터만, 앵커 게이트로 배정 ──
-            clusters = valid_clusters(raw, cluster_max_width_px, cluster_min_pixels)
-            rejected = [c['cx'] for c in raw
-                        if c['width'] > cluster_max_width_px
-                        or c['pixels'] < cluster_min_pixels]
-            if not clusters:
-                bands.append({'valid': False, 'y': y_mid, 'rejected': rejected})
-                continue
-
-            if running_left is not None and running_right is not None:
-                lc = min(clusters, key=lambda c: abs(c['cx'] - running_left))
-                rc = min(clusters, key=lambda c: abs(c['cx'] - running_right))
-                if lc is rc:
-                    # 같은 클러스터가 양쪽 최근접 → 더 가까운 앵커로만 배정
-                    if abs(lc['cx'] - running_left) <= abs(rc['cx'] - running_right):
-                        rc = None
-                    else:
-                        lc = None
-                lx = (lc['cx'] if lc is not None
-                      and abs(lc['cx'] - running_left) <= gate else None)
-                rx = (rc['cx'] if rc is not None
-                      and abs(rc['cx'] - running_right) <= gate else None)
-                if lx is not None and rx is not None:
-                    if lx < rx:
-                        left_x, right_x = lx, rx
-                        weight = lc['pixels'] + rc['pixels']
-                        center = (lx + rx) / 2.0
-                    else:
-                        bands.append({'valid': False, 'y': y_mid})   # 역전 → 버림
-                        continue
-                elif lx is not None:
-                    left_x = lx
-                    weight = lc['pixels']
-                    center = lx + half_width
-                elif rx is not None:
-                    right_x = rx
-                    weight = rc['pixels']
-                    center = rx - half_width
-                else:
-                    bands.append({'valid': False, 'y': y_mid})   # 둘 다 게이트 밖
-                    continue
-            elif len(clusters) >= 2:
-                # 앵커 없음 + 두 줄: 최좌/최우를 좌/우로(폭이 충분히 벌어졌을 때만).
-                lc = min(clusters, key=lambda c: c['cx'])
-                rc = max(clusters, key=lambda c: c['cx'])
-                if rc['cx'] - lc['cx'] >= half_width:
-                    left_x, right_x = lc['cx'], rc['cx']
-                    weight = lc['pixels'] + rc['pixels']
-                    center = (left_x + right_x) / 2.0
-                else:
-                    bands.append({'valid': False, 'y': y_mid})
-                    continue
-            else:
-                # (mod 4) 앵커 없음 + 한 줄: last_known_center prior로 양가설 판정.
-                # 화면 중심 기준 폴백(플립 원인)은 삭제. 확신 없으면 밴드 무효(판정 보류).
-                boundary = clusters[0]['cx']
-                pick = pick_side_hypothesis(
-                    boundary, half_width, width, last_known_center, reacquire_margin)
-                if pick == 'left':
-                    left_x = boundary
-                    weight = clusters[0]['pixels']
-                    center = boundary + half_width
-                elif pick == 'right':
-                    right_x = boundary
-                    weight = clusters[0]['pixels']
-                    center = boundary - half_width
-                else:
-                    bands.append({'valid': False, 'y': y_mid})
-                    continue
+            nearest = min(clusters, key=lambda c: abs(c - running_line))
+            if abs(nearest - running_line) <= hug_track_tol:
+                running_line = ema_step(running_line, nearest, 0.5, hug_track_tol)
+        if branch_hint > 0:
+            left_x = running_line
+            center = running_line + hug_bias
+        else:
+            right_x = running_line
+            center = running_line - hug_bias
 
         center = float(np.clip(center, 0.0, width))
-        # 본 라인만 앵커 갱신(EMA+이동량 상한), 안 보인 쪽은 직전값 유지(안정적 앵커).
-        # hugging 경로는 running_left/right가 이후 밴드에 쓰이지 않으므로 갱신 생략.
-        if branch_hint == 0:
-            if left_x is not None:
-                running_left = ema_step(
-                    running_left, left_x, anchor_alpha_band, anchor_max_step_band_px)
-            if right_x is not None:
-                running_right = ema_step(
-                    running_right, right_x, anchor_alpha_band, anchor_max_step_band_px)
         bands.append({
             'valid': True, 'y': y_mid,
-            'left': left_x, 'right': right_x, 'center': center, 'weight': weight,
-            'rejected': rejected,
+            'left': left_x, 'right': right_x, 'center': center, 'weight': 0,
+            'rejected': [],
         })
 
     return bands, running_line
 
 
 # ------------------------------------------------------------------ #
-#  유효 밴드 전체에 가중 1차 피팅 → offset / angle (mod 3)
+#  유효 밴드 전체에 가중 1차 피팅 → offset / angle
 # ------------------------------------------------------------------ #
 def fit_lane_line(ys, xs, weights, width):
     """(y, lane_center)들에 가중 1차 직선을 맞춰 offset/angle을 뽑는다.
@@ -310,7 +412,7 @@ def fit_lane_line(ys, xs, weights, width):
     기존 규약과 동일하게 맞춘다:
       offset = (최하단 y의 x − width/2) / (width/2)
       angle  = (최상단 x − 최하단 x) / (width/2)   # = 기존 (far.center − near.center)
-    가중치 합이 0이면(예: hugging) 균등 가중으로 대체한다.
+    가중치 합이 0이면 균등 가중으로 대체한다.
     """
     ys = np.asarray(ys, dtype=np.float64)
     xs = np.asarray(xs, dtype=np.float64)
